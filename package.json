@@ -20,10 +20,10 @@
   },
   "homepage": "https://github.com/ahikmah/claudex-switch#readme",
   "bin": {
-    "claudex-switch": "bin/claudex-switch"
+    "claudex-switch": "bin/claudex-switch.js"
   },
   "files": [
-    "bin/claudex-switch",
+    "bin/claudex-switch.js",
     "README.md",
     "LICENSE"
   ],
@@ -31,7 +31,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "check": "zsh -n bin/claudex-switch",
+    "check": "node --check bin/claudex-switch.js",
     "pack:check": "npm pack --dry-run"
   }
 }

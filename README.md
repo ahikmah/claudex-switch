@@ -8,19 +8,23 @@ npm, or any other service.
 
 ## Requirements
 
-- macOS with Homebrew
-- `cliproxyapi` installed and available in `PATH`
-- `jq` installed and available in `PATH`
-- `zsh`
+- Node.js 18 or newer
+- CLIProxyAPI installed and available in `PATH`
 
-The default CLIProxyAPI configuration file is:
+The tool detects a CLIProxyAPI configuration file at these locations:
 
 ```text
 /opt/homebrew/etc/cliproxyapi.conf
+/usr/local/etc/cliproxyapi.conf
+~/.config/cliproxyapi.conf
 ```
 
 Set `CLIPROXY_CONFIG` to use another file. Set `CLIPROXY_AUTH_DIR` to use
 another CLIProxyAPI credential directory.
+
+The tool detects Homebrew on macOS and systemd on Linux. Set
+`CLAUDEX_PROXY_SERVICE=none` if you manage the CLIProxyAPI process yourself.
+You can also set it to `brew` or `systemd`.
 
 ## Install
 
