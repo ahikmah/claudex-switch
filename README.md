@@ -1,5 +1,10 @@
 # claudex-switch
 
+[![npm version](https://img.shields.io/npm/v/claudex-switch?style=for-the-badge&logo=npm&logoColor=white)](https://www.npmjs.com/package/claudex-switch)
+[![Node.js](https://img.shields.io/node/v/claudex-switch?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
+[![GitHub stars](https://img.shields.io/github/stars/ahikmah/claudex-switch?style=for-the-badge&logo=github)](https://github.com/ahikmah/claudex-switch/stargazers)
+[![License](https://img.shields.io/github/license/ahikmah/claudex-switch?style=for-the-badge)](https://github.com/ahikmah/claudex-switch/blob/main/LICENSE)
+
 Switch named Codex OAuth profiles used by Claudex through CLIProxyAPI.
 
 `claudex-switch` keeps one Codex credential active at a time. It stores other
