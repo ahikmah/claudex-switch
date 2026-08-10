@@ -1,0 +1,37 @@
+{
+  "name": "claudex-switch",
+  "version": "0.1.0",
+  "description": "Switch local CLIProxyAPI Codex OAuth profiles used by Claudex.",
+  "keywords": [
+    "claudex",
+    "claude-code",
+    "codex",
+    "cliproxyapi",
+    "account-switcher"
+  ],
+  "license": "MIT",
+  "author": "ahikmah",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ahikmah/claudex-switch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ahikmah/claudex-switch/issues"
+  },
+  "homepage": "https://github.com/ahikmah/claudex-switch#readme",
+  "bin": {
+    "claudex-switch": "bin/claudex-switch"
+  },
+  "files": [
+    "bin/claudex-switch",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "check": "zsh -n bin/claudex-switch",
+    "pack:check": "npm pack --dry-run"
+  }
+}
