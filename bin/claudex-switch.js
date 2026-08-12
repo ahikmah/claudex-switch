@@ -43,20 +43,72 @@ function runService(mode, action) {
   if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed`);
 }
 
-function withProxyStopped(work) {
-  const mode = serviceMode();
-  if (mode === 'none') {
-    console.warn('Proxy restart is disabled or no supported service manager was found.');
-    return work();
+function serviceIsRunning(mode) {
+  if (mode === 'brew') {
+    const result = spawnSync('brew', ['services', 'list', '--json'], { encoding: 'utf8' });
+    if (result.error) throw result.error;
+    if (result.status !== 0) throw new Error('Cannot read Homebrew service state');
+    let services;
+    try {
+      services = JSON.parse(result.stdout || '[]');
+    } catch {
+      throw new Error('Cannot read Homebrew service state');
+    }
+    if (!Array.isArray(services)) services = services.services || [];
+    const service = services.find((entry) => (
+      entry.name === serviceName || entry.service_name === serviceName
+    ));
+    return Boolean(service && (
+      service.running === true
+      || service.status === 'started'
+      || service.status === 'running'
+    ));
   }
 
-  console.log(`Stopping CLIProxyAPI with ${mode}...`);
-  runService(mode, 'stop');
-  try {
-    return work();
-  } finally {
-    runService(mode, 'start');
-  }
+  const result = spawnSync('systemctl', ['--user', 'is-active', '--quiet', serviceName], {
+    stdio: 'ignore',
+  });
+  if (result.error) throw result.error;
+  if (result.status === 0) return true;
+  if ([1, 3, 4].includes(result.status)) return false;
+  throw new Error('Cannot read systemd service state');
+}
+
+function createProxyService() {
+  let mode = null;
+
+  return {
+    isRunning() {
+      mode = serviceMode();
+      if (mode === 'none') {
+        console.warn('Proxy restart is disabled or no supported service manager was found.');
+        return false;
+      }
+      return serviceIsRunning(mode);
+    },
+    stop() {
+      console.log(`Stopping CLIProxyAPI with ${mode}...`);
+      runService(mode, 'stop');
+    },
+    start() {
+      runService(mode, 'start');
+    },
+  };
+}
+
+function isRelevantSessionRunning() {
+  const result = spawnSync(
+    'pgrep',
+    ['-f', '(^|/)(claude|claudex|claude-code|cliproxyapi)([[:space:]]|$)'],
+    { encoding: 'utf8' },
+  );
+  if (result.error) throw new Error('Cannot check for running Claudex or proxy sessions.');
+  if (result.status === 1) return false;
+  if (result.status !== 0) throw new Error('Cannot check for running Claudex or proxy sessions.');
+  return (result.stdout || '')
+    .split(/\s+/)
+    .filter(Boolean)
+    .some((pid) => Number(pid) !== process.pid);
 }
 
 function resolveConfigFile() {
@@ -84,7 +136,8 @@ try {
   const lifecycle = createProfileLifecycle({
     activeDir,
     profilesDir,
-    withProxyStopped,
+    proxyService: createProxyService(),
+    isSessionRunning: isRelevantSessionRunning,
     login,
   });
   process.exitCode = lifecycle.run(process.argv.slice(2), {

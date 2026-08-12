@@ -9,7 +9,7 @@ const test = require('node:test');
 const { createProfileLifecycle } = require('../lib/profile-lifecycle');
 
 function writeCredential(directory, filename, email) {
-  fs.mkdirSync(directory, { recursive: true });
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   fs.writeFileSync(
     path.join(directory, filename),
     JSON.stringify({ email }),
@@ -17,19 +17,24 @@ function writeCredential(directory, filename, email) {
   );
 }
 
-function createHarness(t) {
+function createHarness(t, options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claudex-switch-'));
   const activeDir = path.join(root, 'active');
   const profilesDir = path.join(root, 'profiles');
+  const lockFile = path.join(profilesDir, '.operation.lock');
+  const transactionFile = path.join(profilesDir, '.transaction.json');
   const output = { stdout: [], stderr: [] };
   const events = [];
   let loginNumber = 0;
 
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
-  const lifecycle = createProfileLifecycle({
+  const lifecycleOptions = {
+    filesystem: options.filesystem || fs,
     activeDir,
     profilesDir,
+    lockFile,
+    transactionFile,
     withProxyStopped(work) {
       events.push('proxy:before');
       const result = work();
@@ -40,7 +45,15 @@ function createHarness(t) {
       loginNumber += 1;
       writeCredential(activeDir, `codex-login-${loginNumber}.json`, `login-${loginNumber}@example.com`);
     },
-  });
+  };
+  if (options.isSessionRunning) lifecycleOptions.isSessionRunning = options.isSessionRunning;
+  if (options.proxyService) lifecycleOptions.proxyService = options.proxyService;
+  if (options.withProxyStopped) lifecycleOptions.withProxyStopped = options.withProxyStopped;
+  if (options.operationLock) lifecycleOptions.operationLock = options.operationLock;
+  if (options.recoveryStore) lifecycleOptions.recoveryStore = options.recoveryStore;
+  if (options.login) lifecycleOptions.login = options.login;
+
+  const lifecycle = createProfileLifecycle(lifecycleOptions);
 
   function run(argv) {
     output.stdout.length = 0;
@@ -52,7 +65,7 @@ function createHarness(t) {
     return { code, stdout: [...output.stdout], stderr: [...output.stderr] };
   }
 
-  return { root, activeDir, profilesDir, events, run };
+  return { root, activeDir, profilesDir, lockFile, transactionFile, events, run };
 }
 
 function setActiveProfile(profilesDir, name) {
@@ -97,17 +110,30 @@ test('current reports the active Profile', (t) => {
 test('use switches the active Credential and preserves the old Profile', (t) => {
   const harness = createHarness(t);
   writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
-  writeCredential(path.join(harness.profilesDir, 'work'), 'codex-work.json', 'work@example.com');
+  writeCredential(path.join(harness.profilesDir, 'Work'), 'codex-work.json', 'work@example.com');
   setActiveProfile(harness.profilesDir, 'personal');
 
   const result = harness.run(['use', 'work']);
 
   assert.equal(result.code, 0);
-  assert.deepEqual(result.stdout, ['Active Profile: work']);
-  assert.equal(readActiveProfile(harness.profilesDir), 'work');
+  assert.deepEqual(result.stdout, ['Active Profile: Work']);
+  assert.equal(readActiveProfile(harness.profilesDir), 'Work');
   assert.deepEqual(credentialNames(harness.activeDir), ['codex-work.json']);
   assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), ['codex-personal.json']);
   assert.deepEqual(harness.events, ['proxy:before', 'proxy:after']);
+});
+
+test('use refuses duplicate storage for the already active Profile', (t) => {
+  const harness = createHarness(t);
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.join(harness.profilesDir, 'personal'), 'codex-duplicate.json', 'personal@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['use', 'personal', '--force']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /exactly one Codex Credential|duplicate Credential storage/i);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
 });
 
 test('add logs in and makes the new Profile active', (t) => {
@@ -142,10 +168,23 @@ test('rename keeps the Credential and updates the active Profile name', (t) => {
   assert.equal(fs.existsSync(path.join(harness.profilesDir, 'Work')), false);
 });
 
+test('rename rejects an ambiguous Profile without one Credential', (t) => {
+  const harness = createHarness(t);
+  fs.mkdirSync(path.join(harness.profilesDir, 'empty'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['rename', 'empty', 'new-name', '--force']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /exactly one Codex Credential/i);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'empty')), true);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'new-name')), false);
+});
+
 test('Profile names reject reserved names and case-insensitive collisions', (t) => {
   const harness = createHarness(t);
-  fs.mkdirSync(path.join(harness.profilesDir, 'Work'), { recursive: true });
-  fs.mkdirSync(path.join(harness.profilesDir, 'Team'), { recursive: true });
+  writeCredential(path.join(harness.profilesDir, 'Work'), 'codex-work.json', 'work@example.com');
+  writeCredential(path.join(harness.profilesDir, 'Team'), 'codex-team.json', 'team@example.com');
 
   const collision = harness.run(['add', 'work']);
   const reserved = harness.run(['add', 'list']);
@@ -176,4 +215,399 @@ test('current fails when no active Profile is recorded', (t) => {
   assert.equal(result.code, 1);
   assert.deepEqual(result.stdout, []);
   assert.match(result.stderr[0], /no active profile/i);
+});
+
+test('Profile mutation writes private recovery metadata without Credential values', (t) => {
+  const transactionSnapshots = [];
+  const transactionModes = [];
+  const harness = createHarness(t, {
+    withProxyStopped(work) {
+      transactionSnapshots.push(fs.readFileSync(harness.transactionFile, 'utf8'));
+      transactionModes.push(fs.statSync(harness.transactionFile).mode & 0o777);
+      return work();
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.join(harness.profilesDir, 'work'), 'codex-work.json', 'work@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['use', 'work']);
+
+  assert.equal(result.code, 0);
+  assert.equal(transactionSnapshots.length, 1);
+  assert.deepEqual(transactionModes, [0o600]);
+  assert.match(transactionSnapshots[0], /"operation"\s*:\s*"use"/);
+  assert.doesNotMatch(transactionSnapshots[0], /personal@example\.com|work@example\.com/);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('lock and recovery behavior use injectable runtime adapters', (t) => {
+  let transaction = null;
+  const events = [];
+  const harness = createHarness(t, {
+    operationLock: {
+      acquire(command) {
+        events.push(`acquire:${command}`);
+        return () => events.push('release');
+      },
+    },
+    recoveryStore: {
+      read: () => transaction,
+      write: (next) => {
+        transaction = next;
+      },
+      remove: () => {
+        transaction = null;
+      },
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.join(harness.profilesDir, 'work'), 'codex-work.json', 'work@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['use', 'work', '--force']);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(events, ['acquire:use', 'release']);
+  assert.equal(transaction, null);
+  assert.equal(fs.existsSync(harness.lockFile), false);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('concurrent Profile mutation fails with a lock error', (t) => {
+  const harness = createHarness(t);
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+  fs.writeFileSync(harness.lockFile, '{"pid":1234}\n', { mode: 0o600 });
+
+  const result = harness.run(['use', 'work', '--force']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /another profile mutation is in progress/i);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+});
+
+test('a concurrent mutation started during an active operation fails atomically', (t) => {
+  let secondResult;
+  const secondErrors = [];
+  const harness = createHarness(t, {
+    withProxyStopped(work) {
+      const second = createProfileLifecycle({
+        activeDir: harness.activeDir,
+        profilesDir: harness.profilesDir,
+      });
+      secondResult = second.run(['use', 'work', '--force'], {
+        stdout: () => {},
+        stderr: (line) => secondErrors.push(line),
+      });
+      return work();
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.join(harness.profilesDir, 'work'), 'codex-work.json', 'work@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const firstResult = harness.run(['use', 'work', '--force']);
+
+  assert.equal(firstResult.code, 0);
+  assert.equal(secondResult, 1);
+  assert.match(secondErrors[0], /another profile mutation is in progress/i);
+});
+
+test('file operation failure rolls back the previous Profile state', (t) => {
+  let renameCount = 0;
+  const filesystem = new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'renameSync') return target[property];
+      return (source, destination) => {
+        renameCount += 1;
+        if (renameCount === 2) throw new Error('simulated file operation failure');
+        return target.renameSync(source, destination);
+      };
+    },
+  });
+  const harness = createHarness(t, { filesystem });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.join(harness.profilesDir, 'work'), 'codex-work.json', 'work@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['use', 'work']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /simulated file operation failure/);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'personal')), false);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'work')), ['codex-work.json']);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('add failure removes the new Credential and restores the current Profile', (t) => {
+  let renameCount = 0;
+  const filesystem = new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'renameSync') return target[property];
+      return (source, destination) => {
+        renameCount += 1;
+        if (renameCount === 3) throw new Error('simulated new Credential move failure');
+        return target.renameSync(source, destination);
+      };
+    },
+  });
+  const harness = createHarness(t, { filesystem });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['add', 'team']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /simulated new Credential move failure/);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'personal')), false);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'team')), false);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('add rollback removes a generated Credential symlink', (t) => {
+  const outside = path.join(os.tmpdir(), `claudex-switch-generated-${process.pid}.json`);
+  fs.writeFileSync(outside, JSON.stringify({ email: 'outside@example.com' }), { mode: 0o600 });
+  t.after(() => fs.rmSync(outside, { force: true }));
+  const harness = createHarness(t, {
+    login() {
+      fs.symlinkSync(outside, path.join(harness.activeDir, 'codex-generated.json'));
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['add', 'team', '--force']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /symlink|unsafe/i);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.equal(fs.existsSync(path.join(harness.activeDir, 'codex-generated.json')), false);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('rollback failure leaves recovery state and blocks later mutations', (t) => {
+  let renameCount = 0;
+  const filesystem = new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'renameSync') return target[property];
+      return (source, destination) => {
+        renameCount += 1;
+        if (renameCount === 2 || renameCount === 3) {
+          throw new Error('simulated rollback failure');
+        }
+        return target.renameSync(source, destination);
+      };
+    },
+  });
+  const harness = createHarness(t, { filesystem });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.join(harness.profilesDir, 'work'), 'codex-work.json', 'work@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const failed = harness.run(['use', 'work']);
+  const blocked = harness.run(['use', 'work', '--force']);
+
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr[0], /rollback failed|recovery/i);
+  assert.equal(fs.existsSync(harness.transactionFile), true);
+  assert.equal(blocked.code, 1);
+  assert.match(blocked.stderr[0], /recovery/i);
+});
+
+test('state-changing commands warn about running sessions and --force bypasses only the warning', (t) => {
+  let sessionRunning = true;
+  const harness = createHarness(t, { isSessionRunning: () => sessionRunning });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.join(harness.profilesDir, 'work'), 'codex-work.json', 'work@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const warned = harness.run(['use', 'work']);
+  const forced = harness.run(['use', 'work', '--force']);
+
+  assert.equal(warned.code, 1);
+  assert.match(warned.stderr[0], /claudex or proxy session is running/i);
+  assert.deepEqual(harness.events, ['proxy:before', 'proxy:after']);
+  assert.equal(forced.code, 0);
+  assert.equal(readActiveProfile(harness.profilesDir), 'work');
+  sessionRunning = false;
+});
+
+test('mutation stops when the session check fails', (t) => {
+  const harness = createHarness(t, {
+    isSessionRunning: () => {
+      throw new Error('simulated session check failure');
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.join(harness.profilesDir, 'work'), 'codex-work.json', 'work@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['use', 'work']);
+  const forcedResult = harness.run(['use', 'work', '--force']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /simulated session check failure/);
+  assert.equal(forcedResult.code, 1);
+  assert.match(forcedResult.stderr[0], /simulated session check failure/);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.equal(fs.existsSync(harness.lockFile), false);
+});
+
+test('--force cannot bypass validation or unsafe Profile storage', (t) => {
+  const harness = createHarness(t);
+  const invalid = harness.run(['add', 'not valid', '--force']);
+  assert.equal(invalid.code, 1);
+  assert.match(invalid.stderr[0], /letters, numbers/i);
+  assert.equal(fs.existsSync(harness.lockFile), false);
+
+  const outside = path.join(harness.root, 'outside');
+  writeCredential(outside, 'codex-work.json', 'work@example.com');
+  fs.symlinkSync(outside, path.join(harness.profilesDir, 'work'), 'dir');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const unsafe = harness.run(['use', 'work', '--force']);
+
+  assert.equal(unsafe.code, 1);
+  assert.match(unsafe.stderr[0], /unsafe/i);
+  assert.equal(fs.existsSync(harness.lockFile), false);
+});
+
+test('mutation safety rejects hidden entries and public Credential files', (t) => {
+  const harness = createHarness(t);
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.join(harness.profilesDir, 'work'), 'codex-work.json', 'work@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  fs.mkdirSync(path.join(harness.profilesDir, '.unexpected'), { mode: 0o700 });
+  const hiddenEntry = harness.run(['use', 'work', '--force']);
+  fs.rmdirSync(path.join(harness.profilesDir, '.unexpected'));
+
+  assert.equal(hiddenEntry.code, 1);
+  assert.match(hiddenEntry.stderr[0], /unexpected entry/i);
+
+  fs.chmodSync(path.join(harness.activeDir, 'codex-personal.json'), 0o644);
+  const publicCredential = harness.run(['use', 'work', '--force']);
+
+  assert.equal(publicCredential.code, 1);
+  assert.match(publicCredential.stderr[0], /private/i);
+});
+
+test('proxy service is stopped and restarted only when it was running', (t) => {
+  let running = true;
+  const serviceEvents = [];
+  const harness = createHarness(t, {
+    proxyService: {
+      isRunning: () => running,
+      stop() {
+        serviceEvents.push('stop');
+        running = false;
+      },
+      start() {
+        serviceEvents.push('start');
+        running = true;
+      },
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.join(harness.profilesDir, 'work'), 'codex-work.json', 'work@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const runningResult = harness.run(['use', 'work', '--force']);
+  running = false;
+  const stoppedResult = harness.run(['use', 'personal', '--force']);
+
+  assert.equal(runningResult.code, 0);
+  assert.equal(stoppedResult.code, 0);
+  assert.deepEqual(serviceEvents, ['stop', 'start']);
+});
+
+test('proxy stop failure attempts to restore a previously running service', (t) => {
+  const serviceEvents = [];
+  const harness = createHarness(t, {
+    proxyService: {
+      isRunning: () => true,
+      stop() {
+        serviceEvents.push('stop');
+        throw new Error('simulated proxy stop failure');
+      },
+      start() {
+        serviceEvents.push('start');
+      },
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.join(harness.profilesDir, 'work'), 'codex-work.json', 'work@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['use', 'work', '--force']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /simulated proxy stop failure/);
+  assert.deepEqual(serviceEvents, ['stop', 'start']);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('proxy restart failure keeps the committed Profile selection', (t) => {
+  const harness = createHarness(t, {
+    proxyService: {
+      isRunning: () => true,
+      stop() {},
+      start() {
+        throw new Error('simulated proxy restart failure');
+      },
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.join(harness.profilesDir, 'work'), 'codex-work.json', 'work@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['use', 'work', '--force']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /simulated proxy restart failure/);
+  assert.equal(readActiveProfile(harness.profilesDir), 'work');
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-work.json']);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), ['codex-personal.json']);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('rollback recovery remains visible when proxy restart also fails', (t) => {
+  let renameCount = 0;
+  const filesystem = new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'renameSync') return target[property];
+      return (source, destination) => {
+        renameCount += 1;
+        if (renameCount === 2 || renameCount === 3) throw new Error('simulated rollback failure');
+        return target.renameSync(source, destination);
+      };
+    },
+  });
+  const harness = createHarness(t, {
+    filesystem,
+    proxyService: {
+      isRunning: () => true,
+      stop() {},
+      start() {
+        throw new Error('simulated proxy restart failure');
+      },
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.join(harness.profilesDir, 'work'), 'codex-work.json', 'work@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['use', 'work', '--force']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /manual Profile recovery is required/i);
+  assert.match(result.stderr[0], /proxy restart also failed/i);
+  assert.equal(fs.existsSync(harness.transactionFile), true);
 });

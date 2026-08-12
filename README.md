@@ -70,6 +70,16 @@ Rename a profile:
 claudex-switch rename old personal
 ```
 
+State-changing commands use an operation lock and a private recovery record in
+the Profile directory. A failed file move is rolled back. If rollback also
+fails, later state-changing commands stop until the Profile storage is
+recovered.
+
+If a Claudex or CLIProxyAPI session is running, the command prints a warning
+and stops. Use `--force` only to continue past this warning. It does not skip
+Profile validation, storage safety checks, the operation lock, or recovery
+checks.
+
 ## Safety
 
 Close active Claudex sessions before switching profiles. Start a new Claudex
