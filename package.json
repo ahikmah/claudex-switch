@@ -24,6 +24,7 @@
   },
   "files": [
     "bin/claudex-switch.js",
+    "lib/",
     "README.md",
     "LICENSE"
   ],
@@ -31,7 +32,8 @@
     "node": ">=18"
   },
   "scripts": {
-    "check": "node --check bin/claudex-switch.js",
+    "check": "node --check bin/claudex-switch.js && node --check lib/profile-lifecycle.js",
+    "test": "node --test",
     "pack:check": "npm pack --dry-run"
   }
 }
