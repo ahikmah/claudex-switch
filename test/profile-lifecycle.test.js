@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -26,6 +27,7 @@ function createHarness(t, options = {}) {
   const transactionFile = path.join(profilesDir, '.transaction.json');
   const output = { stdout: [], stderr: [] };
   const events = [];
+  const signalSource = options.signalSource || new EventEmitter();
   let loginNumber = 0;
 
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -34,6 +36,7 @@ function createHarness(t, options = {}) {
     filesystem: options.filesystem || fs,
     activeDir,
     profilesDir,
+    signalSource,
     lockFile,
     transactionFile,
     withProxyStopped(work) {
@@ -71,7 +74,7 @@ function createHarness(t, options = {}) {
     return { code, stdout: [...output.stdout], stderr: [...output.stderr] };
   }
 
-  return { root, activeDir, profilesDir, lockFile, transactionFile, events, run };
+  return { root, activeDir, profilesDir, lockFile, transactionFile, events, signalSource, run };
 }
 
 function setActiveProfile(profilesDir, name) {
@@ -128,6 +131,21 @@ test('current reports the active Profile', (t) => {
 
   assert.equal(result.code, 0);
   assert.deepEqual(result.stdout, ['Active Profile: personal (personal@example.com, active)']);
+});
+
+test('version prints the package version without reading Profile storage', (t) => {
+  const harness = createHarness(t);
+
+  const long = harness.run(['--version']);
+  const short = harness.run(['-v']);
+
+  assert.equal(long.code, 0);
+  assert.deepEqual(long.stdout, [packageMetadata.version]);
+  assert.deepEqual(long.stderr, []);
+  assert.equal(short.code, 0);
+  assert.deepEqual(short.stdout, [packageMetadata.version]);
+  assert.equal(fs.existsSync(harness.activeDir), false);
+  assert.equal(fs.existsSync(harness.profilesDir), false);
 });
 
 test('list, current, and doctor share the read-only JSON Profile contract', (t) => {
@@ -1383,6 +1401,69 @@ test('doctor --repair restores add after generated Credential discovery', (t) =>
   assert.doesNotMatch(JSON.stringify(report), /new-secret/);
 });
 
+test('doctor --repair clears legacy non-Credential login artifacts after rollback', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const personalDir = path.join(harness.profilesDir, 'personal');
+  const targetDir = path.join(harness.profilesDir, 'team');
+  const originalActiveCredential = path.join(harness.activeDir, 'codex-personal.json');
+  const storedPersonalCredential = path.join(personalDir, 'codex-personal.json');
+  const generatedCredential = path.join(harness.activeDir, 'codex-generated.json');
+  const logsDirectory = path.join(harness.activeDir, 'logs');
+  fs.mkdirSync(personalDir, { recursive: true, mode: 0o700 });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+  writeCredential(harness.activeDir, 'codex-generated.json', 'generated@example.com');
+  const generatedCredentialIdentity = generatedIdentity(generatedCredential);
+  fs.unlinkSync(generatedCredential);
+  fs.mkdirSync(logsDirectory, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(logsDirectory, 'session.log'), 'keep this log\n', { mode: 0o600 });
+  fs.writeFileSync(harness.transactionFile, JSON.stringify({
+    schemaVersion: 1,
+    operation: 'add',
+    pid: 7900,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [
+      {
+        type: 'mkdir',
+        path: targetDir,
+        started: true,
+        created: true,
+      },
+      {
+        type: 'move',
+        source: originalActiveCredential,
+        destination: storedPersonalCredential,
+        generated: false,
+        started: true,
+        applied: true,
+      },
+    ],
+    generatedCredentialPaths: [generatedCredential, logsDirectory],
+    generatedCredentialIdentities: [
+      generatedCredentialIdentity,
+      generatedIdentity(logsDirectory),
+    ],
+    credentialPathsBefore: [originalActiveCredential],
+    credentialIdentitiesBefore: [generatedIdentity(originalActiveCredential)],
+    loginDirectory: harness.activeDir,
+    errorCode: 'rollback-failed',
+    error: 'Rollback failed. Manual Profile recovery is required.',
+  }), { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 0);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+  assert.equal(fs.existsSync(originalActiveCredential), true);
+  assert.equal(fs.existsSync(storedPersonalCredential), false);
+  assert.equal(fs.existsSync(targetDir), false);
+  assert.equal(fs.existsSync(path.join(logsDirectory, 'session.log')), true);
+  assert.ok(report.repairs.some((repair) => repair.code === 'transaction-record-cleared'));
+  assert.deepEqual(report.issues, []);
+});
+
 test('doctor --repair does not remove an incomplete completed record', (t) => {
   const harness = createHarness(t);
   fs.mkdirSync(harness.profilesDir, { recursive: true, mode: 0o700 });
@@ -1877,7 +1958,7 @@ test('release help documents the Profile lifecycle contract', (t) => {
   assert.match(help, /schemaVersion: 1/);
   assert.match(help, /active, ready, needs-reauth, invalid, unregistered, unknown/);
   assert.match(help, /0 success, 1 operation or service failure, 2 invalid input, 3 unsafe or incomplete state/);
-  assert.equal(packageMetadata.version, '0.2.1');
+  assert.match(packageMetadata.version, /^\d+\.\d+\.\d+$/);
 });
 
 test('the package command entry point is executable', () => {
@@ -1932,6 +2013,25 @@ test('add logs in and makes the new Profile active', (t) => {
   assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'team')), []);
 });
 
+test('add makes a generated public Credential private before validation', (t) => {
+  const harness = createHarness(t, {
+    login(directory) {
+      writeCredential(directory, 'codex-login-public.json', 'team@example.com');
+      fs.chmodSync(path.join(directory, 'codex-login-public.json'), 0o644);
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['add', 'team', '--force']);
+
+  assert.equal(result.code, 0);
+  assert.equal(readActiveProfile(harness.profilesDir), 'team');
+  assert.equal(permissionMode(path.join(harness.activeDir, 'codex-login-public.json')), 0o600);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
 test('add detects a generated Credential that reuses the old active path', (t) => {
   let harness;
   harness = createHarness(t, {
@@ -1982,7 +2082,7 @@ test('deactivate keeps the active Profile as a ready deactivated Profile', (t) =
   assert.match(current.stderr[0], /no active profile/i);
 });
 
-test('deactivate preserves whether the proxy service was running', (t) => {
+test('deactivate preserves a stopped proxy service after success', (t) => {
   const runningEvents = [];
   let running = true;
   const runningHarness = createHarness(t, {
@@ -2322,7 +2422,7 @@ test('delete leaves the Profile unchanged when Credential removal fails', (t) =>
   assert.equal(fs.existsSync(harness.transactionFile), false);
 });
 
-test('delete preserves running and stopped proxy service states', (t) => {
+test('delete preserves a stopped proxy service after success', (t) => {
   let running = true;
   const runningEvents = [];
   const runningHarness = createHarness(t, {
@@ -2722,6 +2822,49 @@ test('reauth preserves a running proxy service state', (t) => {
   assert.deepEqual(serviceEvents, ['stop', 'start']);
 });
 
+test('reauth starts a stopped proxy service only for the active Profile', (t) => {
+  const activeEvents = [];
+  const activeHarness = createHarness(t, {
+    proxyService: {
+      isRunning: () => false,
+      stop: () => activeEvents.push('stop'),
+      start: () => activeEvents.push('start'),
+    },
+    login() {
+      writeCredential(path.join(activeHarness.profilesDir, 'personal'), 'codex-new.json', 'personal@example.com');
+    },
+  });
+  writeCredential(activeHarness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(activeHarness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(activeHarness.profilesDir, 'personal');
+
+  const activeResult = activeHarness.run(['reauth', 'personal', '--force']);
+
+  assert.equal(activeResult.code, 0);
+  assert.deepEqual(activeEvents, ['start']);
+
+  const inactiveEvents = [];
+  const inactiveHarness = createHarness(t, {
+    proxyService: {
+      isRunning: () => false,
+      stop: () => inactiveEvents.push('stop'),
+      start: () => inactiveEvents.push('start'),
+    },
+    login() {
+      writeCredential(inactiveHarness.activeDir, 'codex-new.json', 'team@example.com');
+    },
+  });
+  writeCredential(inactiveHarness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(inactiveHarness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  writeCredential(path.join(inactiveHarness.profilesDir, 'team'), 'codex-team.json', 'team@example.com');
+  setActiveProfile(inactiveHarness.profilesDir, 'personal');
+
+  const inactiveResult = inactiveHarness.run(['reauth', 'team', '--force']);
+
+  assert.equal(inactiveResult.code, 0);
+  assert.deepEqual(inactiveEvents, []);
+});
+
 test('reauth rolls back a failed inactive Profile replacement', (t) => {
   let renameCount = 0;
   const filesystem = new Proxy(fs, {
@@ -3005,6 +3148,66 @@ test('add failure removes the new Credential and restores the current Profile', 
   assert.equal(fs.existsSync(harness.transactionFile), false);
 });
 
+test('add ignores non-Credential login directories during rollback', (t) => {
+  const harness = createHarness(t, {
+    login(directory) {
+      writeCredential(directory, 'codex-login-1.json', 'login-1@example.com');
+      const logsDirectory = path.join(directory, 'logs');
+      fs.mkdirSync(logsDirectory, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(logsDirectory, 'session.log'), 'login log\n', { mode: 0o600 });
+      throw new Error('simulated login failure');
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['add', 'team', '--force']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /simulated login failure/);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json', 'logs']);
+  assert.equal(fs.existsSync(path.join(harness.activeDir, 'logs', 'session.log')), true);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'team')), false);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('cancelled login rolls back and releases the Profile operation lock', (t) => {
+  let cancelLogin = true;
+  let signalSource;
+  const harness = createHarness(t, {
+    login(directory) {
+      if (cancelLogin) {
+        cancelLogin = false;
+        signalSource.emit('SIGINT');
+        throw new Error('simulated login cancellation');
+      }
+      writeCredential(directory, 'codex-login.json', 'team@example.com');
+    },
+  });
+  signalSource = harness.signalSource;
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const cancelled = harness.run(['add', 'team', '--force']);
+
+  assert.equal(cancelled.code, 130);
+  assert.match(cancelled.stderr[0], /Profile mutation cancelled/i);
+  assert.equal(fs.existsSync(harness.lockFile), false);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'team')), false);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+
+  const retried = harness.run(['add', 'team', '--force']);
+
+  assert.equal(retried.code, 0);
+  assert.equal(fs.existsSync(harness.lockFile), false);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+  assert.equal(readActiveProfile(harness.profilesDir), 'team');
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-login.json']);
+});
+
 test('add rollback removes a generated Credential symlink', (t) => {
   const outside = path.join(os.tmpdir(), `claudex-switch-generated-${process.pid}.json`);
   fs.writeFileSync(outside, JSON.stringify({ email: 'outside@example.com' }), { mode: 0o600 });
@@ -3133,7 +3336,7 @@ test('mutation safety rejects hidden entries and public Credential files', (t) =
   assert.match(publicCredential.stderr[0], /private/i);
 });
 
-test('proxy service is stopped and restarted only when it was running', (t) => {
+test('use starts the proxy service when it was stopped', (t) => {
   let running = true;
   const serviceEvents = [];
   const harness = createHarness(t, {
@@ -3159,7 +3362,29 @@ test('proxy service is stopped and restarted only when it was running', (t) => {
 
   assert.equal(runningResult.code, 0);
   assert.equal(stoppedResult.code, 0);
-  assert.deepEqual(serviceEvents, ['stop', 'start']);
+  assert.deepEqual(serviceEvents, ['stop', 'start', 'start']);
+});
+
+test('using the active Profile starts a stopped proxy service without moving Credentials', (t) => {
+  const serviceEvents = [];
+  const harness = createHarness(t, {
+    proxyService: {
+      isRunning: () => false,
+      stop: () => serviceEvents.push('stop'),
+      start: () => serviceEvents.push('start'),
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['use', 'personal', '--force']);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(result.stdout, ['Already active: personal']);
+  assert.deepEqual(serviceEvents, ['start']);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
 });
 
 test('proxy stop failure attempts to restore a previously running service', (t) => {
@@ -3207,6 +3432,32 @@ test('proxy restart failure keeps the committed Profile selection', (t) => {
 
   assert.equal(result.code, 1);
   assert.match(result.stderr[0], /simulated proxy restart failure/);
+  assert.equal(readActiveProfile(harness.profilesDir), 'work');
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-work.json']);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), ['codex-personal.json']);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('proxy start failure after a stopped service keeps the committed Profile selection', (t) => {
+  const harness = createHarness(t, {
+    proxyService: {
+      isRunning: () => false,
+      stop() {
+        throw new Error('should not stop a stopped proxy');
+      },
+      start() {
+        throw new Error('simulated proxy start failure');
+      },
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.join(harness.profilesDir, 'work'), 'codex-work.json', 'work@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['use', 'work', '--force']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /simulated proxy start failure/);
   assert.equal(readActiveProfile(harness.profilesDir), 'work');
   assert.deepEqual(credentialNames(harness.activeDir), ['codex-work.json']);
   assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), ['codex-personal.json']);

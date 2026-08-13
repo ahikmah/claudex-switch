@@ -42,16 +42,10 @@ npm install --global claudex-switch
 
 ## Upgrade
 
-The latest release is `0.2.1`. Upgrade with:
+Upgrade to the latest release with:
 
 ```bash
-npm install --global claudex-switch@0.2.1
-```
-
-You can also update the global package with:
-
-```bash
-npm update --global claudex-switch
+npm install --global claudex-switch@latest
 ```
 
 ## Commands
@@ -60,6 +54,12 @@ Show command help:
 
 ```bash
 claudex-switch help
+```
+
+Show the installed version:
+
+```bash
+claudex-switch --version
 ```
 
 ### Read Profiles
@@ -231,9 +231,18 @@ or recovery checks.
 
 A failed file move is rolled back. If rollback also fails, later state-changing
 commands stop until `doctor --repair` restores one safe transaction result or
-reports that manual recovery is required. Repair leaves symlinked, unexpected,
+reports that manual recovery is required. Pressing `Ctrl-C` or sending
+`SIGTERM` during a mutation cancels the mutation, rolls back its staged files,
+and releases the operation lock. Repair is needed after a process crash,
+forced termination, or failed rollback. Repair leaves symlinked, unexpected,
 or ambiguous storage unchanged. Recovery records do not contain Credential
 values.
+
+After a successful `use`, `add`, or reauthentication of the active Profile,
+the tool starts CLIProxyAPI when a supported service manager is configured.
+`deactivate`, `delete`, and `rename` keep a stopped proxy stopped. If the proxy
+cannot start, the completed Profile selection is kept and the command reports
+the service error.
 
 ### Exit codes and JSON
 
@@ -241,6 +250,8 @@ values.
 - `1`: operation or proxy service failure.
 - `2`: invalid command or input.
 - `3`: unsafe or incomplete local state, including a failed online diagnosis.
+- `130`: Profile mutation cancelled with `Ctrl-C`.
+- `143`: Profile mutation cancelled with `SIGTERM`.
 
 JSON output uses `schemaVersion: 1`. Profile objects contain the Profile name,
 display email, active flag, health status, and stable error codes. The output

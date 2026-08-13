@@ -44,6 +44,12 @@ function runService(mode, action) {
   if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed`);
 }
 
+function createCancellationError(signal) {
+  const error = new Error('Profile mutation cancelled.');
+  error.exitCode = signal === 'SIGTERM' ? 143 : 130;
+  return error;
+}
+
 function serviceIsRunning(mode) {
   if (mode === 'brew') {
     const result = spawnSync('brew', ['services', 'list', '--json'], { encoding: 'utf8' });
@@ -133,6 +139,9 @@ function login(directory = activeDir) {
     env: { ...process.env, CLIPROXY_AUTH_DIR: directory },
   });
   if (result.error) throw new Error(`Cannot run ${cliproxyapiBin}: ${result.error.message}`);
+  if (result.signal === 'SIGINT' || result.signal === 'SIGTERM') {
+    throw createCancellationError(result.signal);
+  }
   if (result.status !== 0) throw new Error(`${cliproxyapiBin} login failed`);
 }
 
