@@ -40,6 +40,18 @@ You can also set it to `brew` or `systemd`.
 npm install --global claudex-switch
 ```
 
+## Upgrade
+
+Version `0.2.1` fixes the executable command file. Upgrade with:
+
+```bash
+npm install --global claudex-switch@0.2.1
+```
+
+Existing local Profiles and Credentials remain compatible. If `~/.zshrc`
+contains `claudex-switch claude shell-init`, remove that old command. Use the
+`cs` alias to run the current CLI directly.
+
 ## Commands
 
 Show command help:
