@@ -364,6 +364,7 @@ test('read command arguments use stable invalid-input and unsafe-state exit code
   const invalidCommand = harness.run(['not-a-command']);
   const invalidJsonUse = harness.run(['use', 'personal', '--json']);
   const invalidJsonReauth = harness.run(['reauth', 'personal', '--json']);
+  const invalidDeactivateName = harness.run(['deactivate', 'personal']);
   const invalidAccountChangeList = harness.run(['list', '--allow-account-change']);
   const invalidAccountChangeUse = harness.run(['use', 'personal', '--allow-account-change']);
   const help = harness.run(['help']);
@@ -373,10 +374,12 @@ test('read command arguments use stable invalid-input and unsafe-state exit code
   assert.equal(invalidCommand.code, 2);
   assert.equal(invalidJsonUse.code, 2);
   assert.equal(invalidJsonReauth.code, 2);
+  assert.equal(invalidDeactivateName.code, 2);
   assert.equal(invalidAccountChangeList.code, 2);
   assert.equal(invalidAccountChangeUse.code, 2);
   assert.equal(help.code, 0);
   assert.ok(help.stdout.some((line) => line.includes('reauth NAME')));
+  assert.ok(help.stdout.some((line) => line.includes('deactivate [--force]')));
   assert.equal(unknownReauth.code, 2);
   assert.match(unknownReauth.stderr[0], /unknown profile/i);
   assert.equal(unsafe.code, 2);
@@ -427,6 +430,192 @@ test('add logs in and makes the new Profile active', (t) => {
   assert.deepEqual(credentialNames(harness.activeDir), ['codex-login-1.json']);
   assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), ['codex-personal.json']);
   assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'team')), []);
+});
+
+test('deactivate keeps the active Profile as a ready deactivated Profile', (t) => {
+  const harness = createHarness(t);
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['deactivate']);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(result.stdout, ['Deactivated Profile: personal']);
+  assert.deepEqual(result.stderr, []);
+  assert.deepEqual(credentialNames(harness.activeDir), []);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), ['codex-personal.json']);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'active-profile')), false);
+  assert.deepEqual(harness.events, ['proxy:before', 'proxy:after']);
+
+  const list = harness.run(['list']);
+  assert.equal(list.code, 0);
+  assert.deepEqual(list.stdout, ['  personal (personal@example.com, ready)']);
+
+  const current = harness.run(['current']);
+  assert.equal(current.code, 3);
+  assert.deepEqual(current.stdout, []);
+  assert.match(current.stderr[0], /no active profile/i);
+});
+
+test('deactivate preserves whether the proxy service was running', (t) => {
+  const runningEvents = [];
+  let running = true;
+  const runningHarness = createHarness(t, {
+    proxyService: {
+      isRunning: () => running,
+      stop() {
+        runningEvents.push('stop');
+        running = false;
+      },
+      start() {
+        runningEvents.push('start');
+        running = true;
+      },
+    },
+  });
+  writeCredential(runningHarness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(runningHarness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(runningHarness.profilesDir, 'personal');
+
+  const runningResult = runningHarness.run(['deactivate']);
+
+  assert.equal(runningResult.code, 0);
+  assert.deepEqual(runningEvents, ['stop', 'start']);
+  assert.equal(running, true);
+
+  const stoppedEvents = [];
+  const stoppedHarness = createHarness(t, {
+    proxyService: {
+      isRunning: () => false,
+      stop: () => stoppedEvents.push('stop'),
+      start: () => stoppedEvents.push('start'),
+    },
+  });
+  writeCredential(stoppedHarness.activeDir, 'codex-team.json', 'team@example.com');
+  fs.mkdirSync(path.join(stoppedHarness.profilesDir, 'team'), { recursive: true, mode: 0o700 });
+  setActiveProfile(stoppedHarness.profilesDir, 'team');
+
+  const stoppedResult = stoppedHarness.run(['deactivate']);
+
+  assert.equal(stoppedResult.code, 0);
+  assert.deepEqual(stoppedEvents, []);
+});
+
+test('deactivate uses the session warning and --force bypasses only that warning', (t) => {
+  let sessionRunning = true;
+  const harness = createHarness(t, { isSessionRunning: () => sessionRunning });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const warned = harness.run(['deactivate']);
+  const forced = harness.run(['deactivate', '--force']);
+
+  assert.equal(warned.code, 1);
+  assert.match(warned.stderr[0], /claudex or proxy session is running/i);
+  assert.equal(forced.code, 0);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'active-profile')), false);
+  sessionRunning = false;
+});
+
+test('deactivate reports an already empty active selection without changing Profiles', (t) => {
+  const serviceEvents = [];
+  const harness = createHarness(t, {
+    proxyService: {
+      isRunning: () => true,
+      stop: () => serviceEvents.push('stop'),
+      start: () => serviceEvents.push('start'),
+    },
+  });
+  writeCredential(path.join(harness.profilesDir, 'personal'), 'codex-personal.json', 'personal@example.com');
+
+  const result = harness.run(['deactivate']);
+
+  assert.equal(result.code, 3);
+  assert.match(result.stderr[0], /no active profile/i);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), ['codex-personal.json']);
+  assert.deepEqual(serviceEvents, []);
+});
+
+test('deactivate rolls back when moving the active Credential fails', (t) => {
+  const filesystem = new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'renameSync') return target[property];
+      return () => {
+        throw new Error('simulated deactivation move failure');
+      };
+    },
+  });
+  const harness = createHarness(t, { filesystem });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['deactivate']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /simulated deactivation move failure/);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), []);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('deactivate restores the active Profile when removing its selection fails', (t) => {
+  const filesystem = new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'unlinkSync') return target[property];
+      return (file) => {
+        if (path.basename(file) === 'active-profile') {
+          throw new Error('simulated active selection removal failure');
+        }
+        return target.unlinkSync(file);
+      };
+    },
+  });
+  const harness = createHarness(t, { filesystem });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['deactivate']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /simulated active selection removal failure/);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), []);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('deactivate reports a proxy restart failure after committing the empty active state', (t) => {
+  const serviceEvents = [];
+  const harness = createHarness(t, {
+    proxyService: {
+      isRunning: () => true,
+      stop() {
+        serviceEvents.push('stop');
+      },
+      start() {
+        serviceEvents.push('start');
+        throw new Error('simulated deactivation proxy restart failure');
+      },
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['deactivate']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /simulated deactivation proxy restart failure/);
+  assert.deepEqual(serviceEvents, ['stop', 'start']);
+  assert.deepEqual(credentialNames(harness.activeDir), []);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), ['codex-personal.json']);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'active-profile')), false);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
 });
 
 test('reauth replaces the active Profile Credential after validation', (t) => {

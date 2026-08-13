@@ -94,6 +94,15 @@ the explicit opt-in:
 claudex-switch reauth personal --allow-account-change
 ```
 
+Deactivate the active Profile without deleting its Credential:
+
+```bash
+claudex-switch deactivate
+```
+
+The Profile remains available with `ready` status. No Profile is selected
+until you use it again.
+
 Rename a profile:
 
 ```bash
