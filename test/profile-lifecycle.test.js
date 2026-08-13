@@ -52,6 +52,9 @@ function createHarness(t, options = {}) {
   if (options.operationLock) lifecycleOptions.operationLock = options.operationLock;
   if (options.recoveryStore) lifecycleOptions.recoveryStore = options.recoveryStore;
   if (options.login) lifecycleOptions.login = options.login;
+  if (options.confirmProfileDeletion) {
+    lifecycleOptions.confirmProfileDeletion = options.confirmProfileDeletion;
+  }
 
   const lifecycle = createProfileLifecycle(lifecycleOptions);
 
@@ -364,9 +367,11 @@ test('read command arguments use stable invalid-input and unsafe-state exit code
   const invalidCommand = harness.run(['not-a-command']);
   const invalidJsonUse = harness.run(['use', 'personal', '--json']);
   const invalidJsonReauth = harness.run(['reauth', 'personal', '--json']);
+  const invalidJsonDelete = harness.run(['delete', 'personal', '--json', '--yes']);
   const invalidDeactivateName = harness.run(['deactivate', 'personal']);
   const invalidAccountChangeList = harness.run(['list', '--allow-account-change']);
   const invalidAccountChangeUse = harness.run(['use', 'personal', '--allow-account-change']);
+  const invalidYesUse = harness.run(['use', 'personal', '--yes']);
   const help = harness.run(['help']);
   const unknownReauth = harness.run(['reauth', 'missing']);
   const unsafe = harness.run(['doctor', '--json', '--force']);
@@ -374,12 +379,15 @@ test('read command arguments use stable invalid-input and unsafe-state exit code
   assert.equal(invalidCommand.code, 2);
   assert.equal(invalidJsonUse.code, 2);
   assert.equal(invalidJsonReauth.code, 2);
+  assert.equal(invalidJsonDelete.code, 2);
   assert.equal(invalidDeactivateName.code, 2);
   assert.equal(invalidAccountChangeList.code, 2);
   assert.equal(invalidAccountChangeUse.code, 2);
+  assert.equal(invalidYesUse.code, 2);
   assert.equal(help.code, 0);
   assert.ok(help.stdout.some((line) => line.includes('reauth NAME')));
   assert.ok(help.stdout.some((line) => line.includes('deactivate [--force]')));
+  assert.ok(help.stdout.some((line) => line.includes('delete NAME [--yes] [--force]')));
   assert.equal(unknownReauth.code, 2);
   assert.match(unknownReauth.stderr[0], /unknown profile/i);
   assert.equal(unsafe.code, 2);
@@ -615,6 +623,246 @@ test('deactivate reports a proxy restart failure after committing the empty acti
   assert.deepEqual(credentialNames(harness.activeDir), []);
   assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), ['codex-personal.json']);
   assert.equal(fs.existsSync(path.join(harness.profilesDir, 'active-profile')), false);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('delete removes an inactive Profile after exact-name confirmation', (t) => {
+  const confirmations = [];
+  const harness = createHarness(t, {
+    confirmProfileDeletion(name) {
+      confirmations.push(name);
+      return 'team';
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'team@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['delete', 'team']);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(result.stdout, ['Deleted Profile: team']);
+  assert.deepEqual(result.stderr, []);
+  assert.deepEqual(confirmations, ['team']);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'team')), false);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.deepEqual(harness.events, ['proxy:before', 'proxy:after']);
+  assert.deepEqual(fs.readdirSync(harness.profilesDir).sort(), ['active-profile', 'personal']);
+});
+
+test('delete requires confirmation to match the stored Profile name exactly', (t) => {
+  const serviceEvents = [];
+  const harness = createHarness(t, {
+    confirmProfileDeletion: () => 'team',
+    proxyService: {
+      isRunning: () => true,
+      stop: () => serviceEvents.push('stop'),
+      start: () => serviceEvents.push('start'),
+    },
+  });
+  writeCredential(path.join(harness.profilesDir, 'Team'), 'codex-team.json', 'team@example.com');
+
+  const result = harness.run(['delete', 'team', '--force']);
+
+  assert.equal(result.code, 2);
+  assert.match(result.stderr[0], /exactly match Profile 'Team'/);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'Team')), ['codex-team.json']);
+  assert.deepEqual(serviceEvents, []);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('delete uses the session warning before confirmation', (t) => {
+  let sessionRunning = true;
+  const confirmations = [];
+  const harness = createHarness(t, {
+    isSessionRunning: () => sessionRunning,
+    confirmProfileDeletion(name) {
+      confirmations.push(name);
+      return name;
+    },
+  });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'team@example.com');
+
+  const warned = harness.run(['delete', 'team']);
+  const forced = harness.run(['delete', 'team', '--force']);
+
+  assert.equal(warned.code, 1);
+  assert.match(warned.stderr[0], /claudex or proxy session is running/i);
+  assert.deepEqual(confirmations, ['team']);
+  assert.equal(forced.code, 0);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'team')), false);
+  sessionRunning = false;
+});
+
+test('delete --yes removes the last Profile without interactive confirmation', (t) => {
+  const harness = createHarness(t);
+  writeCredential(path.join(harness.profilesDir, 'personal'), 'codex-personal.json', 'personal@example.com');
+
+  const result = harness.run(['delete', 'personal', '--yes']);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(result.stdout, ['Deleted Profile: personal']);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'personal')), false);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'active-profile')), false);
+  assert.deepEqual(credentialNames(harness.activeDir), []);
+});
+
+test('delete refuses the active Profile and instructs the user to deactivate it', (t) => {
+  const harness = createHarness(t);
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['delete', 'personal', '--yes']);
+
+  assert.equal(result.code, 2);
+  assert.match(result.stderr[0], /active.*deactivate/i);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'personal')), true);
+});
+
+test('delete reports recovery when directory removal fails after permanent Credential deletion', (t) => {
+  const filesystem = new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'rmdirSync') return target[property];
+      return (directory) => {
+        if (path.basename(directory) === 'team') {
+          throw new Error('simulated Profile directory removal failure');
+        }
+        return target.rmdirSync(directory);
+      };
+    },
+  });
+  const harness = createHarness(t, {
+    filesystem,
+    confirmProfileDeletion: () => 'team',
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'team@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const failed = harness.run(['delete', 'team']);
+  const blocked = harness.run(['delete', 'team', '--yes', '--force']);
+
+  assert.equal(failed.code, 3);
+  assert.match(failed.stderr[0], /rollback failed|recovery/i);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'team')), true);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'team')), []);
+  assert.equal(fs.existsSync(harness.transactionFile), true);
+  assert.equal(blocked.code, 3);
+  assert.match(blocked.stderr[0], /recovery/i);
+});
+
+test('delete refuses symlinked and unexpected Profile storage without changing it', (t) => {
+  const symlinkHarness = createHarness(t);
+  const outside = path.join(symlinkHarness.root, 'outside');
+  writeCredential(outside, 'codex-team.json', 'team@example.com');
+  fs.mkdirSync(symlinkHarness.profilesDir, { recursive: true, mode: 0o700 });
+  fs.symlinkSync(outside, path.join(symlinkHarness.profilesDir, 'team'), 'dir');
+
+  const symlinked = symlinkHarness.run(['delete', 'team', '--yes', '--force']);
+
+  assert.equal(symlinked.code, 3);
+  assert.match(symlinked.stderr[0], /symlink|unsafe/i);
+  assert.equal(fs.lstatSync(path.join(symlinkHarness.profilesDir, 'team')).isSymbolicLink(), true);
+  assert.deepEqual(credentialNames(outside), ['codex-team.json']);
+
+  const unexpectedHarness = createHarness(t);
+  const targetDir = path.join(unexpectedHarness.profilesDir, 'team');
+  writeCredential(targetDir, 'codex-team.json', 'team@example.com');
+  fs.writeFileSync(path.join(targetDir, 'unexpected.txt'), 'keep me\n', { mode: 0o600 });
+
+  const unexpected = unexpectedHarness.run(['delete', 'team', '--yes', '--force']);
+
+  assert.equal(unexpected.code, 3);
+  assert.match(unexpected.stderr[0], /unexpected file|unsafe/i);
+  assert.deepEqual(credentialNames(targetDir), ['codex-team.json', 'unexpected.txt']);
+});
+
+test('delete leaves the Profile unchanged when Credential removal fails', (t) => {
+  const filesystem = new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'unlinkSync') return target[property];
+      return (file) => {
+        if (path.basename(file) === 'codex-team.json') {
+          throw new Error('simulated Credential removal failure');
+        }
+        return target.unlinkSync(file);
+      };
+    },
+  });
+  const harness = createHarness(t, { filesystem });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'team@example.com');
+
+  const result = harness.run(['delete', 'team', '--yes']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /simulated Credential removal failure/);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'team')), ['codex-team.json']);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('delete preserves running and stopped proxy service states', (t) => {
+  let running = true;
+  const runningEvents = [];
+  const runningHarness = createHarness(t, {
+    proxyService: {
+      isRunning: () => running,
+      stop() {
+        runningEvents.push('stop');
+        running = false;
+      },
+      start() {
+        runningEvents.push('start');
+        running = true;
+      },
+    },
+  });
+  writeCredential(path.join(runningHarness.profilesDir, 'team'), 'codex-team.json', 'team@example.com');
+
+  const runningResult = runningHarness.run(['delete', 'team', '--yes']);
+
+  assert.equal(runningResult.code, 0);
+  assert.deepEqual(runningEvents, ['stop', 'start']);
+  assert.equal(running, true);
+
+  const stoppedEvents = [];
+  const stoppedHarness = createHarness(t, {
+    proxyService: {
+      isRunning: () => false,
+      stop: () => stoppedEvents.push('stop'),
+      start: () => stoppedEvents.push('start'),
+    },
+  });
+  writeCredential(path.join(stoppedHarness.profilesDir, 'team'), 'codex-team.json', 'team@example.com');
+
+  const stoppedResult = stoppedHarness.run(['delete', 'team', '--yes']);
+
+  assert.equal(stoppedResult.code, 0);
+  assert.deepEqual(stoppedEvents, []);
+});
+
+test('delete reports proxy restart failure after permanent local deletion', (t) => {
+  const harness = createHarness(t, {
+    proxyService: {
+      isRunning: () => true,
+      stop() {},
+      start() {
+        throw new Error('simulated deletion proxy restart failure');
+      },
+    },
+  });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'team@example.com');
+
+  const result = harness.run(['delete', 'team', '--yes']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /simulated deletion proxy restart failure/);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'team')), false);
   assert.equal(fs.existsSync(harness.transactionFile), false);
 });
 

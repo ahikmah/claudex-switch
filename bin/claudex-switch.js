@@ -135,12 +135,32 @@ function login(directory = activeDir) {
   if (result.status !== 0) throw new Error(`${cliproxyapiBin} login failed`);
 }
 
+function confirmProfileDeletion(name) {
+  fs.writeSync(1, `Type Profile name '${name}' to confirm permanent local deletion: `);
+  const chunks = [];
+  const buffer = Buffer.alloc(1024);
+  try {
+    while (true) {
+      const bytesRead = fs.readSync(0, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      const chunk = buffer.toString('utf8', 0, bytesRead);
+      chunks.push(chunk);
+      if (chunk.includes('\n')) break;
+    }
+  } catch {
+    throw new Error('Cannot read Profile deletion confirmation.');
+  }
+  if (!process.stdin.isTTY) fs.writeSync(1, '\n');
+  return chunks.join('').split(/\r?\n/, 1)[0];
+}
+
 try {
   const lifecycle = createProfileLifecycle({
     activeDir,
     profilesDir,
     proxyService: createProxyService(),
     isSessionRunning: isRelevantSessionRunning,
+    confirmProfileDeletion,
     login,
   });
   process.exitCode = lifecycle.run(process.argv.slice(2), {

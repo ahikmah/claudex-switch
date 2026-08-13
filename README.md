@@ -103,6 +103,18 @@ claudex-switch deactivate
 The Profile remains available with `ready` status. No Profile is selected
 until you use it again.
 
+Delete an inactive local Profile and its Credential permanently:
+
+```bash
+claudex-switch delete personal
+```
+
+Type the exact stored Profile name to confirm. For an approved script, use
+`claudex-switch delete personal --yes`. An active Profile must be deactivated
+before deletion. Deletion does not select another Profile, does not keep a
+hidden Credential copy, and does not delete or change the remote Provider
+account.
+
 Rename a profile:
 
 ```bash
