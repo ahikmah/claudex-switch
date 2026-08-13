@@ -339,6 +339,25 @@ test('doctor human output reports health and issue codes', (t) => {
   assert.deepEqual(result.stderr, []);
 });
 
+test('doctor marks every Profile invalid when shared storage permissions are unsafe', (t) => {
+  const harness = createHarness(t);
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'team@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+  fs.chmodSync(harness.profilesDir, 0o755);
+
+  const result = harness.run(['doctor', '--json']);
+  const report = readJson(result);
+  const profiles = new Map(report.profiles.map((profile) => [profile.name, profile]));
+
+  assert.equal(result.code, 3);
+  assert.equal(profiles.get('personal').status, 'invalid');
+  assert.equal(profiles.get('team').status, 'invalid');
+  assert.ok(profiles.get('personal').errorCodes.includes('permissions'));
+  assert.ok(profiles.get('team').errorCodes.includes('permissions'));
+});
+
 test('read command arguments use stable invalid-input and unsafe-state exit codes', (t) => {
   const harness = createHarness(t);
 
@@ -375,7 +394,7 @@ test('use refuses duplicate storage for the already active Profile', (t) => {
 
   const result = harness.run(['use', 'personal', '--force']);
 
-  assert.equal(result.code, 1);
+  assert.equal(result.code, 3);
   assert.match(result.stderr[0], /exactly one Codex Credential|duplicate Credential storage/i);
   assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
 });
@@ -419,7 +438,7 @@ test('rename rejects an ambiguous Profile without one Credential', (t) => {
 
   const result = harness.run(['rename', 'empty', 'new-name', '--force']);
 
-  assert.equal(result.code, 1);
+  assert.equal(result.code, 3);
   assert.match(result.stderr[0], /exactly one Codex Credential/i);
   assert.equal(fs.existsSync(path.join(harness.profilesDir, 'empty')), true);
   assert.equal(fs.existsSync(path.join(harness.profilesDir, 'new-name')), false);
@@ -437,17 +456,17 @@ test('Profile names reject reserved names and case-insensitive collisions', (t) 
   const renameCollision = harness.run(['rename', 'work', 'team']);
   const renameInvalid = harness.run(['rename', 'work', 'not valid']);
 
-  assert.equal(collision.code, 1);
+  assert.equal(collision.code, 2);
   assert.match(collision.stderr[0], /already exists/i);
-  assert.equal(reserved.code, 1);
+  assert.equal(reserved.code, 2);
   assert.match(reserved.stderr[0], /reserved/i);
-  assert.equal(invalid.code, 1);
+  assert.equal(invalid.code, 2);
   assert.match(invalid.stderr[0], /letters, numbers/i);
-  assert.equal(useReserved.code, 1);
+  assert.equal(useReserved.code, 2);
   assert.match(useReserved.stderr[0], /reserved/i);
-  assert.equal(renameCollision.code, 1);
+  assert.equal(renameCollision.code, 2);
   assert.match(renameCollision.stderr[0], /already exists/i);
-  assert.equal(renameInvalid.code, 1);
+  assert.equal(renameInvalid.code, 2);
   assert.match(renameInvalid.stderr[0], /letters, numbers/i);
 });
 
@@ -628,7 +647,7 @@ test('add rollback removes a generated Credential symlink', (t) => {
 
   const result = harness.run(['add', 'team', '--force']);
 
-  assert.equal(result.code, 1);
+  assert.equal(result.code, 3);
   assert.match(result.stderr[0], /symlink|unsafe/i);
   assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
   assert.equal(fs.existsSync(path.join(harness.activeDir, 'codex-generated.json')), false);
@@ -657,10 +676,10 @@ test('rollback failure leaves recovery state and blocks later mutations', (t) =>
   const failed = harness.run(['use', 'work']);
   const blocked = harness.run(['use', 'work', '--force']);
 
-  assert.equal(failed.code, 1);
+  assert.equal(failed.code, 3);
   assert.match(failed.stderr[0], /rollback failed|recovery/i);
   assert.equal(fs.existsSync(harness.transactionFile), true);
-  assert.equal(blocked.code, 1);
+  assert.equal(blocked.code, 3);
   assert.match(blocked.stderr[0], /recovery/i);
 });
 
@@ -706,7 +725,7 @@ test('mutation stops when the session check fails', (t) => {
 test('--force cannot bypass validation or unsafe Profile storage', (t) => {
   const harness = createHarness(t);
   const invalid = harness.run(['add', 'not valid', '--force']);
-  assert.equal(invalid.code, 1);
+  assert.equal(invalid.code, 2);
   assert.match(invalid.stderr[0], /letters, numbers/i);
   assert.equal(fs.existsSync(harness.lockFile), false);
 
@@ -717,7 +736,7 @@ test('--force cannot bypass validation or unsafe Profile storage', (t) => {
 
   const unsafe = harness.run(['use', 'work', '--force']);
 
-  assert.equal(unsafe.code, 1);
+  assert.equal(unsafe.code, 3);
   assert.match(unsafe.stderr[0], /unsafe/i);
   assert.equal(fs.existsSync(harness.lockFile), false);
 });
@@ -732,13 +751,13 @@ test('mutation safety rejects hidden entries and public Credential files', (t) =
   const hiddenEntry = harness.run(['use', 'work', '--force']);
   fs.rmdirSync(path.join(harness.profilesDir, '.unexpected'));
 
-  assert.equal(hiddenEntry.code, 1);
+  assert.equal(hiddenEntry.code, 3);
   assert.match(hiddenEntry.stderr[0], /unexpected entry/i);
 
   fs.chmodSync(path.join(harness.activeDir, 'codex-personal.json'), 0o644);
   const publicCredential = harness.run(['use', 'work', '--force']);
 
-  assert.equal(publicCredential.code, 1);
+  assert.equal(publicCredential.code, 3);
   assert.match(publicCredential.stderr[0], /private/i);
 });
 
