@@ -8,8 +8,11 @@
 Switch named Codex OAuth profiles used by Claudex through CLIProxyAPI.
 
 `claudex-switch` keeps one Codex credential active at a time. It stores other
-credentials in local profile folders. It does not send credentials to GitHub,
-npm, or any other service.
+credentials in local profile folders. Offline commands do not contact the
+Provider or send Credential data to any service. `doctor --online` is the only
+exception: it sends each locally valid Credential only to the Provider health
+endpoint for the requested check. It does not send Credential data to GitHub
+or npm.
 
 ## Requirements
 
@@ -60,6 +63,19 @@ offline health check with:
 claudex-switch doctor
 claudex-switch doctor --json
 ```
+
+Run an explicit read-only online Credential check with:
+
+```bash
+claudex-switch doctor --online
+claudex-switch doctor --online --json
+```
+
+Online diagnosis checks each locally valid Credential through the online health
+adapter. It does not start Reauthentication, change Credential or Profile
+files, move Credentials, or restart the proxy. A rejected or expired
+Credential is reported as `needs-reauth`. Provider or network uncertainty is
+reported as `unknown` and returns exit code `3`.
 
 Apply only repairs that have one safe result:
 

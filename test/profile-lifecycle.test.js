@@ -53,6 +53,7 @@ function createHarness(t, options = {}) {
   if (options.operationLock) lifecycleOptions.operationLock = options.operationLock;
   if (options.recoveryStore) lifecycleOptions.recoveryStore = options.recoveryStore;
   if (options.login) lifecycleOptions.login = options.login;
+  if (options.onlineHealthCheck) lifecycleOptions.onlineHealthCheck = options.onlineHealthCheck;
   if (options.confirmProfileDeletion) {
     lifecycleOptions.confirmProfileDeletion = options.confirmProfileDeletion;
   }
@@ -482,6 +483,186 @@ test('doctor --repair does not create storage when there is nothing to repair', 
   });
   assert.equal(fs.existsSync(harness.activeDir), false);
   assert.equal(fs.existsSync(harness.profilesDir), false);
+});
+
+test('doctor --online reports healthy Profiles with the common JSON contract', (t) => {
+  const checks = [];
+  let loginCalls = 0;
+  const harness = createHarness(t, {
+    login() {
+      loginCalls += 1;
+      throw new Error('reauthentication must not start');
+    },
+    onlineHealthCheck({ profile, credentialFile }) {
+      checks.push({ profile, credentialFile });
+      return { status: 'valid' };
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'same@example.com', { scope: 'personal' });
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'same@example.com', { scope: 'team' });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['doctor', '--online', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(report, {
+    schemaVersion: 1,
+    profiles: [
+      {
+        name: 'personal',
+        email: 'same@example.com',
+        active: true,
+        status: 'active',
+        errorCodes: [],
+      },
+      {
+        name: 'team',
+        email: 'same@example.com',
+        active: false,
+        status: 'ready',
+        errorCodes: [],
+      },
+    ],
+    issues: [],
+  });
+  assert.deepEqual(checks.map(({ profile, credentialFile }) => ({
+    profile,
+    credentialFile: path.basename(credentialFile),
+  })), [
+    {
+      profile: {
+        name: 'personal',
+        email: 'same@example.com',
+        active: true,
+        status: 'active',
+        errorCodes: [],
+      },
+      credentialFile: 'codex-personal.json',
+    },
+    {
+      profile: {
+        name: 'team',
+        email: 'same@example.com',
+        active: false,
+        status: 'ready',
+        errorCodes: [],
+      },
+      credentialFile: 'codex-team.json',
+    },
+  ]);
+  assert.equal(loginCalls, 0);
+  assert.deepEqual(harness.events, []);
+});
+
+test('doctor --online reports a rejected Credential as needs-reauth in human output', (t) => {
+  let loginCalls = 0;
+  const harness = createHarness(t, {
+    login() {
+      loginCalls += 1;
+      throw new Error('reauthentication must not start');
+    },
+    onlineHealthCheck() {
+      return { status: 'unauthorized' };
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+  const before = fs.readFileSync(path.join(harness.activeDir, 'codex-personal.json'), 'utf8');
+
+  const result = harness.run(['doctor', '--online']);
+
+  assert.equal(result.code, 3);
+  assert.deepEqual(result.stdout, [
+    'Profile health:',
+    '* personal (personal@example.com, needs-reauth)',
+    "Issue [credential-rejected]: Online check rejected the Credential for Profile 'personal'. Reauthentication is required.",
+  ]);
+  assert.deepEqual(result.stderr, []);
+  assert.equal(fs.readFileSync(path.join(harness.activeDir, 'codex-personal.json'), 'utf8'), before);
+  assert.equal(loginCalls, 0);
+  assert.deepEqual(harness.events, []);
+});
+
+test('doctor --online reports an expired Credential as needs-reauth', (t) => {
+  const harness = createHarness(t, {
+    onlineHealthCheck() {
+      return { status: 'expired' };
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['doctor', '--online', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.deepEqual(report.profiles[0], {
+    name: 'personal',
+    email: 'personal@example.com',
+    active: true,
+    status: 'needs-reauth',
+    errorCodes: ['credential-expired'],
+  });
+  assert.deepEqual(report.issues, [{
+    code: 'credential-expired',
+    profile: 'personal',
+    message: "Online check rejected the Credential for Profile 'personal'. Reauthentication is required.",
+  }]);
+});
+
+test('doctor --online reports a network failure as unknown with a non-zero exit code', (t) => {
+  const harness = createHarness(t, {
+    onlineHealthCheck() {
+      const error = new Error('provider is unavailable');
+      error.code = 'network-error';
+      throw error;
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['doctor', '--online', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.deepEqual(report, {
+    schemaVersion: 1,
+    profiles: [{
+      name: 'personal',
+      email: 'personal@example.com',
+      active: true,
+      status: 'unknown',
+      errorCodes: ['network-error'],
+    }],
+    issues: [{
+      code: 'network-error',
+      profile: 'personal',
+      message: "Online check could not confirm the Credential for Profile 'personal'.",
+    }],
+  });
+});
+
+test('offline doctor does not call the online health adapter', (t) => {
+  const harness = createHarness(t, {
+    onlineHealthCheck() {
+      throw new Error('offline diagnosis must not check the Provider');
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['doctor', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 0);
+  assert.equal(report.profiles[0].status, 'active');
+  assert.deepEqual(report.issues, []);
 });
 
 test('doctor --repair removes a stale operation lock after its owner stops', (t) => {
@@ -1646,6 +1827,9 @@ test('read command arguments use stable invalid-input and unsafe-state exit code
   const invalidAccountChangeUse = harness.run(['use', 'personal', '--allow-account-change']);
   const invalidYesUse = harness.run(['use', 'personal', '--yes']);
   const invalidRepairList = harness.run(['list', '--repair']);
+  const invalidOnlineList = harness.run(['list', '--online']);
+  const invalidOnlineRepair = harness.run(['doctor', '--online', '--repair']);
+  const invalidOnlineHelp = harness.run(['help', '--online']);
   const help = harness.run(['help']);
   const unknownReauth = harness.run(['reauth', 'missing']);
   const unsafe = harness.run(['doctor', '--json', '--force']);
@@ -1659,7 +1843,11 @@ test('read command arguments use stable invalid-input and unsafe-state exit code
   assert.equal(invalidAccountChangeUse.code, 2);
   assert.equal(invalidYesUse.code, 2);
   assert.equal(invalidRepairList.code, 2);
+  assert.equal(invalidOnlineList.code, 2);
+  assert.equal(invalidOnlineRepair.code, 2);
+  assert.equal(invalidOnlineHelp.code, 2);
   assert.equal(help.code, 0);
+  assert.ok(help.stdout.some((line) => line.includes('doctor --online [--json]')));
   assert.ok(help.stdout.some((line) => line.includes('doctor --repair [--json] [--force]')));
   assert.ok(help.stdout.some((line) => line.includes('reauth NAME')));
   assert.ok(help.stdout.some((line) => line.includes('deactivate [--force]')));

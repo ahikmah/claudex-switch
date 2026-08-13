@@ -13,6 +13,7 @@ const activeDir = process.env.CLIPROXY_AUTH_DIR || path.join(home, '.cli-proxy-a
 const profilesDir = process.env.CLAUDEX_ACCOUNT_DIR || path.join(home, '.cli-proxy-api-accounts');
 const serviceName = process.env.CLAUDEX_PROXY_SERVICE_NAME || 'cliproxyapi';
 const cliproxyapiBin = process.env.CLIPROXYAPI_BIN || 'cliproxyapi';
+const onlineHealthUrl = 'https://chatgpt.com/backend-api/codex/models';
 
 function commandExists(command) {
   const result = spawnSync(command, ['--version'], { stdio: 'ignore' });
@@ -135,6 +136,57 @@ function login(directory = activeDir) {
   if (result.status !== 0) throw new Error(`${cliproxyapiBin} login failed`);
 }
 
+function escapeCurlConfigValue(value) {
+  return String(value)
+    .replaceAll('\\', '\\\\')
+    .replaceAll('"', '\\"')
+    .replaceAll('\r', '\\r')
+    .replaceAll('\n', '\\n');
+}
+
+function createOnlineHealthCheck() {
+  return ({ credentialFile }) => {
+    let credential;
+    try {
+      credential = JSON.parse(fs.readFileSync(credentialFile, 'utf8'));
+    } catch {
+      return { status: 'unknown', errorCode: 'online-check-failed' };
+    }
+
+    const token = credential.access_token || credential.token_data?.access_token;
+    if (typeof token !== 'string' || !token) {
+      return { status: 'unknown', errorCode: 'online-check-failed' };
+    }
+    const accountId = credential.account_id || credential.token_data?.account_id;
+    const config = [
+      `header = "Authorization: Bearer ${escapeCurlConfigValue(token)}"`,
+      ...(typeof accountId === 'string' && accountId
+        ? [`header = "ChatGPT-Account-ID: ${escapeCurlConfigValue(accountId)}"`]
+        : []),
+      `url = "${onlineHealthUrl}"`,
+    ].join('\n');
+    const result = spawnSync(
+      'curl',
+      [
+        '--config', '-',
+        '--silent',
+        '--show-error',
+        '--max-time', '15',
+        '--output', process.platform === 'win32' ? 'NUL' : '/dev/null',
+        '--write-out', '%{http_code}',
+      ],
+      { input: `${config}\n`, encoding: 'utf8' },
+    );
+    if (result.error || result.status !== 0) {
+      return { status: 'unknown', errorCode: 'network-error' };
+    }
+    const statusCode = Number((result.stdout || '').trim());
+    if ([401, 403].includes(statusCode)) return { status: 'rejected' };
+    if (statusCode >= 200 && statusCode < 300) return { status: 'valid' };
+    return { status: 'unknown', errorCode: 'online-check-failed' };
+  };
+}
+
 function confirmProfileDeletion(name) {
   fs.writeSync(1, `Type Profile name '${name}' to confirm permanent local deletion: `);
   const chunks = [];
@@ -162,6 +214,7 @@ try {
     isSessionRunning: isRelevantSessionRunning,
     confirmProfileDeletion,
     login,
+    onlineHealthCheck: createOnlineHealthCheck(),
   });
   process.exitCode = lifecycle.run(process.argv.slice(2), {
     stdout: (line) => console.log(line),
