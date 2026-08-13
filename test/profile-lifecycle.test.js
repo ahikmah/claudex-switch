@@ -47,6 +47,7 @@ function createHarness(t, options = {}) {
     },
   };
   if (options.isSessionRunning) lifecycleOptions.isSessionRunning = options.isSessionRunning;
+  if (options.isProcessRunning) lifecycleOptions.isProcessRunning = options.isProcessRunning;
   if (options.proxyService) lifecycleOptions.proxyService = options.proxyService;
   if (options.withProxyStopped) lifecycleOptions.withProxyStopped = options.withProxyStopped;
   if (options.operationLock) lifecycleOptions.operationLock = options.operationLock;
@@ -82,6 +83,15 @@ function readActiveProfile(profilesDir) {
 
 function credentialNames(directory) {
   return fs.readdirSync(directory).sort();
+}
+
+function permissionMode(target) {
+  return fs.statSync(target).mode & 0o777;
+}
+
+function generatedIdentity(recordedPath, currentPath = recordedPath) {
+  const stats = fs.lstatSync(currentPath);
+  return { path: recordedPath, device: stats.dev, inode: stats.ino };
 }
 
 function readJson(result) {
@@ -361,6 +371,1269 @@ test('doctor marks every Profile invalid when shared storage permissions are uns
   assert.ok(profiles.get('team').errorCodes.includes('permissions'));
 });
 
+test('doctor --repair fixes deterministic directory and file permissions', (t) => {
+  const harness = createHarness(t);
+  const inactiveDir = path.join(harness.profilesDir, 'team');
+  const inactiveCredential = path.join(inactiveDir, 'codex-team.json');
+  const activeCredential = path.join(harness.activeDir, 'codex-personal.json');
+  const stateFile = path.join(harness.profilesDir, 'active-profile');
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  writeCredential(inactiveDir, 'codex-team.json', 'team@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+  fs.chmodSync(harness.activeDir, 0o755);
+  fs.chmodSync(harness.profilesDir, 0o755);
+  fs.chmodSync(inactiveDir, 0o500);
+  fs.chmodSync(activeCredential, 0o644);
+  fs.chmodSync(inactiveCredential, 0o400);
+  fs.chmodSync(stateFile, 0o400);
+
+  const result = harness.run(['doctor', '--repair']);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(result.stderr, []);
+  assert.ok(result.stdout.some((line) => line.startsWith('Repair [permissions-repaired]:')));
+  assert.equal(permissionMode(harness.activeDir), 0o700);
+  assert.equal(permissionMode(harness.profilesDir), 0o700);
+  assert.equal(permissionMode(inactiveDir), 0o700);
+  assert.equal(permissionMode(activeCredential), 0o600);
+  assert.equal(permissionMode(inactiveCredential), 0o600);
+  assert.equal(permissionMode(stateFile), 0o600);
+});
+
+test('doctor --repair uses the session warning and --force bypasses only that warning', (t) => {
+  let sessionRunning = true;
+  const harness = createHarness(t, { isSessionRunning: () => sessionRunning });
+  fs.mkdirSync(harness.profilesDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(harness.profilesDir, 0o755);
+
+  const humanWarning = harness.run(['doctor', '--repair']);
+  const warned = harness.run(['doctor', '--repair', '--json']);
+  const warningReport = readJson(warned);
+
+  assert.equal(humanWarning.code, 3);
+  assert.deepEqual(humanWarning.stderr, []);
+  assert.ok(humanWarning.stdout.some((line) => line.startsWith('Issue [session-running]:')));
+  assert.equal(warned.code, 3);
+  assert.deepEqual(warned.stderr, []);
+  assert.ok(warningReport.issues.some((issue) => issue.code === 'session-running'));
+  assert.equal(permissionMode(harness.profilesDir), 0o755);
+
+  const forced = harness.run(['doctor', '--repair', '--json', '--force']);
+  assert.equal(forced.code, 0);
+  assert.equal(permissionMode(harness.profilesDir), 0o700);
+  sessionRunning = false;
+});
+
+test('doctor --repair changes Profile root permissions only while holding the lock', (t) => {
+  let profilesDir;
+  let lockFile;
+  let changedWithoutLock = false;
+  const filesystem = new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'chmodSync') return target[property];
+      return (file, mode) => {
+        if (file === profilesDir && !target.existsSync(lockFile)) changedWithoutLock = true;
+        return target.chmodSync(file, mode);
+      };
+    },
+  });
+  const harness = createHarness(t, { filesystem });
+  profilesDir = harness.profilesDir;
+  lockFile = harness.lockFile;
+  fs.mkdirSync(profilesDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(profilesDir, 0o755);
+
+  const result = harness.run(['doctor', '--repair']);
+
+  assert.equal(result.code, 0);
+  assert.equal(changedWithoutLock, false);
+  assert.equal(permissionMode(profilesDir), 0o700);
+});
+
+test('doctor --repair JSON reports a Profile root permission repair', (t) => {
+  const harness = createHarness(t);
+  fs.mkdirSync(harness.profilesDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(harness.profilesDir, 0o755);
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 0);
+  assert.equal(permissionMode(harness.profilesDir), 0o700);
+  assert.ok(report.repairs.some((repair) => (
+    repair.code === 'permissions-repaired' && repair.target === 'Profile storage'
+  )));
+  assert.deepEqual(report.issues, []);
+});
+
+test('doctor --repair does not create storage when there is nothing to repair', (t) => {
+  const harness = createHarness(t);
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(report, {
+    schemaVersion: 1,
+    profiles: [],
+    issues: [],
+    repairs: [],
+  });
+  assert.equal(fs.existsSync(harness.activeDir), false);
+  assert.equal(fs.existsSync(harness.profilesDir), false);
+});
+
+test('doctor --repair removes a stale operation lock after its owner stops', (t) => {
+  const checkedPids = [];
+  const lockEvents = [];
+  const harness = createHarness(t, {
+    isProcessRunning(pid) {
+      checkedPids.push(pid);
+      return false;
+    },
+    operationLock: {
+      acquire(command) {
+        lockEvents.push(`acquire:${command}`);
+        return () => lockEvents.push('release');
+      },
+    },
+  });
+  fs.mkdirSync(harness.profilesDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(harness.lockFile, JSON.stringify({
+    schemaVersion: 1,
+    operation: 'use',
+    pid: 4242,
+    startedAt: '2026-08-13T00:00:00.000Z',
+  }), { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(checkedPids, [4242]);
+  assert.deepEqual(lockEvents, ['acquire:doctor --repair', 'release']);
+  assert.equal(fs.existsSync(harness.lockFile), false);
+  assert.ok(report.repairs.some((repair) => repair.code === 'stale-operation-lock-removed'));
+  assert.deepEqual(report.issues, []);
+});
+
+test('doctor --repair reports an active operation lock and leaves it unchanged', (t) => {
+  const checkedPids = [];
+  const harness = createHarness(t, {
+    isProcessRunning(pid) {
+      checkedPids.push(pid);
+      return true;
+    },
+  });
+  const lockContent = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'reauth',
+    pid: 5151,
+    startedAt: '2026-08-13T00:00:00.000Z',
+  });
+  fs.mkdirSync(harness.profilesDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(harness.lockFile, lockContent, { mode: 0o644 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.deepEqual(checkedPids, [5151]);
+  assert.equal(fs.readFileSync(harness.lockFile, 'utf8'), lockContent);
+  assert.equal(permissionMode(harness.lockFile), 0o644);
+  assert.deepEqual(report.repairs, []);
+  assert.ok(report.issues.some((issue) => issue.code === 'operation-in-progress'));
+});
+
+test('doctor --repair reports an active lock before a running session', (t) => {
+  const harness = createHarness(t, {
+    isProcessRunning: () => true,
+    isSessionRunning: () => true,
+  });
+  const lockContent = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'use',
+    pid: 5252,
+    startedAt: '2026-08-13T00:00:00.000Z',
+  });
+  fs.mkdirSync(harness.profilesDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(harness.lockFile, lockContent, { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.deepEqual(result.stderr, []);
+  assert.equal(fs.readFileSync(harness.lockFile, 'utf8'), lockContent);
+  assert.ok(report.issues.some((issue) => issue.code === 'operation-in-progress'));
+});
+
+test('doctor --repair restores a deterministic staged transaction', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const personalDir = path.join(harness.profilesDir, 'personal');
+  const teamDir = path.join(harness.profilesDir, 'team');
+  const originalActiveCredential = path.join(harness.activeDir, 'codex-personal.json');
+  const stagedPersonalCredential = path.join(personalDir, 'codex-personal.json');
+  const originalTeamCredential = path.join(teamDir, 'codex-team.json');
+  const stagedTeamCredential = path.join(harness.activeDir, 'codex-team.json');
+  const stateFile = path.join(harness.profilesDir, 'active-profile');
+  fs.mkdirSync(personalDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(teamDir, { recursive: true, mode: 0o700 });
+  writeCredential(personalDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(harness.activeDir, 'codex-team.json', 'team@example.com', {
+    access_token: 'secret-token',
+  });
+  setActiveProfile(harness.profilesDir, 'team');
+  fs.writeFileSync(harness.transactionFile, JSON.stringify({
+    schemaVersion: 1,
+    operation: 'use',
+    pid: 6262,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [
+      {
+        type: 'move',
+        source: originalActiveCredential,
+        destination: stagedPersonalCredential,
+        generated: false,
+        started: true,
+        applied: true,
+      },
+      {
+        type: 'move',
+        source: originalTeamCredential,
+        destination: stagedTeamCredential,
+        generated: false,
+        started: true,
+        applied: true,
+      },
+      {
+        type: 'state',
+        path: stateFile,
+        beforeExists: true,
+        beforeMode: 0o600,
+        beforeProfile: 'personal',
+        started: true,
+        applied: true,
+      },
+    ],
+    generatedCredentialPaths: [],
+    generatedCredentialIdentities: [],
+    credentialPathsBefore: [originalActiveCredential, originalTeamCredential],
+    credentialIdentitiesBefore: [
+      generatedIdentity(originalActiveCredential, stagedPersonalCredential),
+      generatedIdentity(originalTeamCredential, stagedTeamCredential),
+    ],
+    errorCode: 'rollback-failed',
+    error: 'Rollback failed. Manual Profile recovery is required.',
+  }), { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 0);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.equal(fs.existsSync(originalActiveCredential), true);
+  assert.equal(fs.existsSync(stagedPersonalCredential), false);
+  assert.equal(fs.existsSync(originalTeamCredential), true);
+  assert.equal(fs.existsSync(stagedTeamCredential), false);
+  assert.ok(report.repairs.some((repair) => repair.code === 'transaction-restored'));
+  assert.deepEqual(report.issues, []);
+  assert.doesNotMatch(JSON.stringify(report), /secret-token/);
+});
+
+test('doctor --repair does not restore a transaction while its owner runs', (t) => {
+  const checkedPids = [];
+  const harness = createHarness(t, {
+    isProcessRunning(pid) {
+      checkedPids.push(pid);
+      return true;
+    },
+  });
+  const teamDir = path.join(harness.profilesDir, 'team');
+  const originalCredential = path.join(teamDir, 'codex-team.json');
+  const stagedCredential = path.join(harness.activeDir, 'codex-team.json');
+  fs.mkdirSync(teamDir, { recursive: true, mode: 0o700 });
+  writeCredential(harness.activeDir, 'codex-team.json', 'team@example.com');
+  const transaction = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'use',
+    pid: 6363,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'active',
+    steps: [{
+      type: 'move',
+      source: originalCredential,
+      destination: stagedCredential,
+      generated: false,
+      started: true,
+      applied: true,
+    }],
+    generatedCredentialPaths: [],
+  });
+  fs.writeFileSync(harness.transactionFile, transaction, { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.deepEqual(checkedPids, [6363]);
+  assert.equal(fs.existsSync(stagedCredential), true);
+  assert.equal(fs.existsSync(originalCredential), false);
+  assert.equal(fs.readFileSync(harness.transactionFile, 'utf8'), transaction);
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-owner-active'));
+});
+
+test('doctor --repair leaves an ambiguous transaction unchanged and mutations blocked', (t) => {
+  const harness = createHarness(t);
+  const teamDir = path.join(harness.profilesDir, 'team');
+  const originalCredential = path.join(teamDir, 'codex-team.json');
+  const stagedCredential = path.join(harness.activeDir, 'codex-team.json');
+  writeCredential(teamDir, 'codex-team.json', 'original@example.com', {
+    access_token: 'original-secret',
+  });
+  writeCredential(harness.activeDir, 'codex-team.json', 'staged@example.com', {
+    access_token: 'staged-secret',
+  });
+  const transaction = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'use',
+    pid: 7373,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [{
+      type: 'move',
+      source: originalCredential,
+      destination: stagedCredential,
+      generated: false,
+      started: true,
+      applied: false,
+    }],
+    generatedCredentialPaths: [],
+  });
+  fs.writeFileSync(harness.transactionFile, transaction, { mode: 0o600 });
+  const originalBefore = fs.readFileSync(originalCredential, 'utf8');
+  const stagedBefore = fs.readFileSync(stagedCredential, 'utf8');
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.equal(fs.readFileSync(originalCredential, 'utf8'), originalBefore);
+  assert.equal(fs.readFileSync(stagedCredential, 'utf8'), stagedBefore);
+  assert.equal(fs.readFileSync(harness.transactionFile, 'utf8'), transaction);
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-ambiguous'));
+  assert.doesNotMatch(JSON.stringify(report), /original-secret|staged-secret/);
+
+  const mutation = harness.run(['use', 'team', '--force']);
+  assert.equal(mutation.code, 3);
+  assert.match(mutation.stderr[0], /recovery is required/i);
+});
+
+test('doctor --repair preflights every rollback step before changing state', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const createdDir = path.join(harness.profilesDir, 'new-profile');
+  const unexpected = path.join(createdDir, 'unexpected.txt');
+  const stateFile = path.join(harness.profilesDir, 'active-profile');
+  fs.mkdirSync(createdDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(unexpected, 'keep me', { mode: 0o600 });
+  setActiveProfile(harness.profilesDir, 'team');
+  const transaction = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'add',
+    pid: 7575,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [
+      {
+        type: 'mkdir',
+        path: createdDir,
+        started: true,
+        created: true,
+      },
+      {
+        type: 'state',
+        path: stateFile,
+        beforeExists: true,
+        beforeMode: 0o600,
+        beforeProfile: 'personal',
+        started: true,
+        applied: true,
+      },
+    ],
+    generatedCredentialPaths: [],
+  });
+  fs.writeFileSync(harness.transactionFile, transaction, { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.equal(readActiveProfile(harness.profilesDir), 'team');
+  assert.equal(fs.readFileSync(unexpected, 'utf8'), 'keep me');
+  assert.equal(fs.readFileSync(harness.transactionFile, 'utf8'), transaction);
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-ambiguous'));
+});
+
+test('doctor --repair rejects a state change without its required use move', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const stateFile = path.join(harness.profilesDir, 'active-profile');
+  fs.mkdirSync(harness.profilesDir, { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'team');
+  const transaction = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'use',
+    pid: 7585,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [{
+      type: 'state',
+      path: stateFile,
+      beforeExists: true,
+      beforeMode: 0o600,
+      beforeProfile: 'personal',
+      started: true,
+      applied: true,
+    }],
+    generatedCredentialPaths: [],
+  });
+  fs.writeFileSync(harness.transactionFile, transaction, { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.equal(readActiveProfile(harness.profilesDir), 'team');
+  assert.equal(fs.readFileSync(harness.transactionFile, 'utf8'), transaction);
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-ambiguous'));
+});
+
+test('doctor --repair rejects a use state that does not match its Credential move', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const activeCredential = path.join(harness.activeDir, 'codex-personal.json');
+  const storedCredential = path.join(harness.profilesDir, 'personal', 'codex-personal.json');
+  fs.mkdirSync(path.dirname(storedCredential), { recursive: true, mode: 0o700 });
+  writeCredential(path.dirname(storedCredential), path.basename(storedCredential), 'personal@example.com');
+  setActiveProfile(harness.profilesDir, 'team');
+  const transaction = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'use',
+    pid: 7586,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [
+      {
+        type: 'move',
+        source: activeCredential,
+        destination: storedCredential,
+        generated: false,
+        started: true,
+        applied: true,
+      },
+      {
+        type: 'state',
+        path: path.join(harness.profilesDir, 'active-profile'),
+        beforeExists: true,
+        beforeMode: 0o600,
+        beforeProfile: 'other',
+        started: true,
+        applied: true,
+      },
+    ],
+    generatedCredentialPaths: [],
+    credentialPathsBefore: [activeCredential],
+  });
+  fs.writeFileSync(harness.transactionFile, transaction, { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.equal(readActiveProfile(harness.profilesDir), 'team');
+  assert.equal(fs.existsSync(activeCredential), false);
+  assert.equal(fs.existsSync(storedCredential), true);
+  assert.equal(fs.readFileSync(harness.transactionFile, 'utf8'), transaction);
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-ambiguous'));
+});
+
+test('doctor --repair removes a directory created before its journal marker was saved', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const createdDir = path.join(harness.profilesDir, 'new-profile');
+  fs.mkdirSync(harness.activeDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(createdDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(harness.transactionFile, JSON.stringify({
+    schemaVersion: 1,
+    operation: 'add',
+    pid: 7676,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [{
+      type: 'mkdir',
+      path: createdDir,
+      started: true,
+      created: false,
+    }],
+    generatedCredentialPaths: [],
+  }), { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+
+  assert.equal(result.code, 0);
+  assert.equal(fs.existsSync(createdDir), false);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('doctor --repair does not trust generated paths for an unrelated operation', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const teamCredential = path.join(harness.profilesDir, 'team', 'codex-team.json');
+  writeCredential(path.dirname(teamCredential), path.basename(teamCredential), 'team@example.com', {
+    access_token: 'team-secret',
+  });
+  const transaction = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'use',
+    pid: 7878,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [],
+    generatedCredentialPaths: [teamCredential],
+  });
+  fs.writeFileSync(harness.transactionFile, transaction, { mode: 0o600 });
+  const credentialBefore = fs.readFileSync(teamCredential, 'utf8');
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.equal(fs.readFileSync(teamCredential, 'utf8'), credentialBefore);
+  assert.equal(fs.readFileSync(harness.transactionFile, 'utf8'), transaction);
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-ambiguous'));
+  assert.doesNotMatch(JSON.stringify(report), /team-secret/);
+});
+
+test('doctor --repair does not treat the old active Credential as generated by add', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const activeCredential = path.join(harness.activeDir, 'codex-personal.json');
+  const targetDir = path.join(harness.profilesDir, 'team');
+  const claimedDestination = path.join(targetDir, 'codex-personal.json');
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com', {
+    access_token: 'personal-secret',
+  });
+  fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+  const transaction = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'add',
+    pid: 7898,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [
+      {
+        type: 'mkdir',
+        path: targetDir,
+        started: true,
+        created: true,
+      },
+      {
+        type: 'move',
+        source: activeCredential,
+        destination: claimedDestination,
+        generated: true,
+        started: false,
+        applied: false,
+      },
+    ],
+    generatedCredentialPaths: [activeCredential],
+    generatedCredentialIdentities: [generatedIdentity(activeCredential)],
+    credentialPathsBefore: [],
+  });
+  fs.writeFileSync(harness.transactionFile, transaction, { mode: 0o600 });
+  const credentialBefore = fs.readFileSync(activeCredential, 'utf8');
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.equal(fs.readFileSync(activeCredential, 'utf8'), credentialBefore);
+  assert.equal(fs.readFileSync(harness.transactionFile, 'utf8'), transaction);
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-ambiguous'));
+  assert.doesNotMatch(JSON.stringify(report), /personal-secret/);
+});
+
+test('doctor --repair restores add when a generated Credential reuses the old path', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const personalDir = path.join(harness.profilesDir, 'personal');
+  const targetDir = path.join(harness.profilesDir, 'team');
+  const activeCredential = path.join(harness.activeDir, 'codex-personal.json');
+  const storedCredential = path.join(personalDir, 'codex-personal.json');
+  fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  writeCredential(personalDir, 'codex-personal.json', 'personal@example.com', {
+    access_token: 'old-secret',
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'team@example.com', {
+    access_token: 'new-secret',
+  });
+  setActiveProfile(harness.profilesDir, 'personal');
+  fs.writeFileSync(harness.transactionFile, JSON.stringify({
+    schemaVersion: 1,
+    operation: 'add',
+    pid: 7897,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [
+      {
+        type: 'mkdir',
+        path: targetDir,
+        started: true,
+        created: true,
+      },
+      {
+        type: 'move',
+        source: activeCredential,
+        destination: storedCredential,
+        generated: false,
+        started: true,
+        applied: true,
+      },
+    ],
+    generatedCredentialPaths: [activeCredential],
+    generatedCredentialIdentities: [generatedIdentity(activeCredential)],
+    credentialPathsBefore: [activeCredential],
+    credentialIdentitiesBefore: [generatedIdentity(activeCredential, storedCredential)],
+  }), { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 0);
+  assert.equal(fs.existsSync(storedCredential), false);
+  assert.equal(fs.existsSync(activeCredential), true);
+  assert.match(fs.readFileSync(activeCredential, 'utf8'), /old-secret/);
+  assert.equal(fs.existsSync(targetDir), false);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+  assert.ok(report.repairs.some((repair) => repair.code === 'transaction-restored'));
+  assert.doesNotMatch(JSON.stringify(report), /old-secret|new-secret/);
+});
+
+test('doctor --repair removes all recorded generated Credentials', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const targetDir = path.join(harness.profilesDir, 'team');
+  const firstCredential = path.join(harness.activeDir, 'codex-first.json');
+  const secondCredential = path.join(harness.activeDir, 'codex-second.json');
+  fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  writeCredential(harness.activeDir, 'codex-first.json', 'first@example.com');
+  writeCredential(harness.activeDir, 'codex-second.json', 'second@example.com');
+  fs.writeFileSync(harness.transactionFile, JSON.stringify({
+    schemaVersion: 1,
+    operation: 'add',
+    pid: 7896,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [{
+      type: 'mkdir',
+      path: targetDir,
+      started: true,
+      created: true,
+    }],
+    generatedCredentialPaths: [firstCredential, secondCredential],
+    generatedCredentialIdentities: [
+      generatedIdentity(firstCredential),
+      generatedIdentity(secondCredential),
+    ],
+    credentialPathsBefore: [],
+    credentialIdentitiesBefore: [],
+  }), { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 0);
+  assert.equal(fs.existsSync(firstCredential), false);
+  assert.equal(fs.existsSync(secondCredential), false);
+  assert.equal(fs.existsSync(targetDir), false);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+  assert.ok(report.repairs.some((repair) => repair.code === 'transaction-restored'));
+});
+
+test('doctor --repair leaves a partly recorded generated set unchanged', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const personalDir = path.join(harness.profilesDir, 'personal');
+  const targetDir = path.join(harness.profilesDir, 'team');
+  const oldActiveCredential = path.join(harness.activeDir, 'codex-personal.json');
+  const storedCredential = path.join(personalDir, 'codex-personal.json');
+  const recordedCredential = path.join(harness.activeDir, 'codex-first.json');
+  const unrecordedCredential = path.join(harness.activeDir, 'codex-second.json');
+  fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  writeCredential(personalDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(harness.activeDir, 'codex-first.json', 'first@example.com');
+  writeCredential(harness.activeDir, 'codex-second.json', 'second@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+  const transaction = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'add',
+    pid: 7895,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [
+      {
+        type: 'mkdir',
+        path: targetDir,
+        started: true,
+        created: true,
+      },
+      {
+        type: 'move',
+        source: oldActiveCredential,
+        destination: storedCredential,
+        generated: false,
+        started: true,
+        applied: true,
+      },
+    ],
+    generatedCredentialPaths: [recordedCredential],
+    generatedCredentialIdentities: [generatedIdentity(recordedCredential)],
+    credentialPathsBefore: [oldActiveCredential],
+    credentialIdentitiesBefore: [generatedIdentity(oldActiveCredential, storedCredential)],
+  });
+  fs.writeFileSync(harness.transactionFile, transaction, { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.equal(fs.existsSync(recordedCredential), true);
+  assert.equal(fs.existsSync(unrecordedCredential), true);
+  assert.equal(fs.existsSync(storedCredential), true);
+  assert.equal(fs.existsSync(oldActiveCredential), false);
+  assert.equal(fs.readFileSync(harness.transactionFile, 'utf8'), transaction);
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-ambiguous'));
+});
+
+test('doctor --repair leaves an unrecorded first generated Credential unchanged', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const targetDir = path.join(harness.profilesDir, 'team');
+  const generatedCredential = path.join(harness.activeDir, 'codex-first.json');
+  fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  writeCredential(harness.activeDir, 'codex-first.json', 'first@example.com');
+  const transaction = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'add',
+    pid: 7894,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [{
+      type: 'mkdir',
+      path: targetDir,
+      started: true,
+      created: true,
+    }],
+    generatedCredentialPaths: [],
+    generatedCredentialIdentities: [],
+    credentialPathsBefore: [],
+    credentialIdentitiesBefore: [],
+  });
+  fs.writeFileSync(harness.transactionFile, transaction, { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.equal(fs.existsSync(generatedCredential), true);
+  assert.equal(fs.existsSync(targetDir), true);
+  assert.equal(fs.readFileSync(harness.transactionFile, 'utf8'), transaction);
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-ambiguous'));
+});
+
+test('doctor --repair restores add after generated Credential discovery', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const personalDir = path.join(harness.profilesDir, 'personal');
+  const targetDir = path.join(harness.profilesDir, 'team');
+  const originalActiveCredential = path.join(harness.activeDir, 'codex-personal.json');
+  const storedPersonalCredential = path.join(personalDir, 'codex-personal.json');
+  const generatedCredential = path.join(harness.activeDir, 'codex-new.json');
+  fs.mkdirSync(personalDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  writeCredential(personalDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(harness.activeDir, 'codex-new.json', 'new@example.com', {
+    access_token: 'new-secret',
+  });
+  setActiveProfile(harness.profilesDir, 'personal');
+  fs.writeFileSync(harness.transactionFile, JSON.stringify({
+    schemaVersion: 1,
+    operation: 'add',
+    pid: 7899,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [
+      {
+        type: 'mkdir',
+        path: targetDir,
+        started: true,
+        created: true,
+      },
+      {
+        type: 'move',
+        source: originalActiveCredential,
+        destination: storedPersonalCredential,
+        generated: false,
+        started: true,
+        applied: true,
+      },
+    ],
+    generatedCredentialPaths: [generatedCredential],
+    generatedCredentialIdentities: [generatedIdentity(generatedCredential)],
+    credentialPathsBefore: [originalActiveCredential],
+  }), { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 0);
+  assert.equal(fs.existsSync(generatedCredential), false);
+  assert.equal(fs.existsSync(originalActiveCredential), true);
+  assert.equal(fs.existsSync(storedPersonalCredential), false);
+  assert.equal(fs.existsSync(targetDir), false);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+  assert.ok(report.repairs.some((repair) => repair.code === 'transaction-restored'));
+  assert.doesNotMatch(JSON.stringify(report), /new-secret/);
+});
+
+test('doctor --repair does not remove an incomplete completed record', (t) => {
+  const harness = createHarness(t);
+  fs.mkdirSync(harness.profilesDir, { recursive: true, mode: 0o700 });
+  const transaction = JSON.stringify({ schemaVersion: 1, status: 'committed' });
+  fs.writeFileSync(harness.transactionFile, transaction, { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.equal(fs.readFileSync(harness.transactionFile, 'utf8'), transaction);
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-ambiguous'));
+});
+
+test('doctor --repair clears a complete committed record without rolling it back', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const activeCredential = path.join(harness.activeDir, 'codex-team.json');
+  const storedCredential = path.join(harness.profilesDir, 'team', 'codex-team.json');
+  writeCredential(path.dirname(storedCredential), path.basename(storedCredential), 'team@example.com');
+  fs.writeFileSync(harness.transactionFile, JSON.stringify({
+    schemaVersion: 1,
+    operation: 'deactivate',
+    pid: 7761,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'committed',
+    cleanupReady: true,
+    steps: [
+      {
+        type: 'move',
+        source: activeCredential,
+        destination: storedCredential,
+        generated: false,
+        started: true,
+        applied: true,
+      },
+      {
+        type: 'state',
+        path: path.join(harness.profilesDir, 'active-profile'),
+        beforeExists: true,
+        beforeMode: 0o600,
+        beforeProfile: 'team',
+        started: true,
+        applied: true,
+      },
+    ],
+    generatedCredentialPaths: [],
+    generatedCredentialIdentities: [],
+    credentialPathsBefore: [activeCredential],
+    credentialIdentitiesBefore: [generatedIdentity(activeCredential, storedCredential)],
+  }), { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 0);
+  assert.equal(fs.existsSync(activeCredential), false);
+  assert.equal(fs.existsSync(storedCredential), true);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'active-profile')), false);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+  assert.ok(report.repairs.some((repair) => repair.code === 'transaction-record-cleared'));
+});
+
+test('doctor --repair clears a complete rolled-back record', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const activeCredential = path.join(harness.activeDir, 'codex-team.json');
+  const storedCredential = path.join(harness.profilesDir, 'team', 'codex-team.json');
+  writeCredential(harness.activeDir, 'codex-team.json', 'team@example.com');
+  fs.mkdirSync(path.dirname(storedCredential), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'team');
+  fs.writeFileSync(harness.transactionFile, JSON.stringify({
+    schemaVersion: 1,
+    operation: 'deactivate',
+    pid: 7762,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'rolled-back',
+    cleanupReady: true,
+    steps: [
+      {
+        type: 'move',
+        source: activeCredential,
+        destination: storedCredential,
+        generated: false,
+        started: true,
+        applied: true,
+      },
+      {
+        type: 'state',
+        path: path.join(harness.profilesDir, 'active-profile'),
+        beforeExists: true,
+        beforeMode: 0o600,
+        beforeProfile: 'team',
+        started: true,
+        applied: true,
+      },
+    ],
+    generatedCredentialPaths: [],
+    generatedCredentialIdentities: [],
+    credentialPathsBefore: [activeCredential],
+    credentialIdentitiesBefore: [generatedIdentity(activeCredential)],
+  }), { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 0);
+  assert.equal(fs.existsSync(activeCredential), true);
+  assert.equal(fs.existsSync(storedCredential), false);
+  assert.equal(readActiveProfile(harness.profilesDir), 'team');
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+  assert.ok(report.repairs.some((repair) => repair.code === 'transaction-record-cleared'));
+});
+
+test('doctor --repair clears a rolled-back switch with two Credential moves', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const personalCredential = path.join(harness.activeDir, 'codex-personal.json');
+  const stagedPersonalCredential = path.join(harness.profilesDir, 'personal', 'codex-personal.json');
+  const teamCredential = path.join(harness.profilesDir, 'team', 'codex-team.json');
+  const stagedTeamCredential = path.join(harness.activeDir, 'codex-team.json');
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  writeCredential(path.dirname(teamCredential), path.basename(teamCredential), 'team@example.com');
+  fs.mkdirSync(path.dirname(stagedPersonalCredential), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+  fs.writeFileSync(harness.transactionFile, JSON.stringify({
+    schemaVersion: 1,
+    operation: 'use',
+    pid: 7763,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'rolled-back',
+    cleanupReady: true,
+    steps: [
+      {
+        type: 'move',
+        source: personalCredential,
+        destination: stagedPersonalCredential,
+        generated: false,
+        started: true,
+        applied: true,
+      },
+      {
+        type: 'move',
+        source: teamCredential,
+        destination: stagedTeamCredential,
+        generated: false,
+        started: true,
+        applied: true,
+      },
+      {
+        type: 'state',
+        path: path.join(harness.profilesDir, 'active-profile'),
+        beforeExists: true,
+        beforeMode: 0o600,
+        beforeProfile: 'personal',
+        started: true,
+        applied: true,
+      },
+    ],
+    generatedCredentialPaths: [],
+    generatedCredentialIdentities: [],
+    credentialPathsBefore: [personalCredential, teamCredential],
+    credentialIdentitiesBefore: [
+      generatedIdentity(personalCredential),
+      generatedIdentity(teamCredential),
+    ],
+  }), { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 0);
+  assert.equal(fs.existsSync(personalCredential), true);
+  assert.equal(fs.existsSync(stagedPersonalCredential), false);
+  assert.equal(fs.existsSync(teamCredential), true);
+  assert.equal(fs.existsSync(stagedTeamCredential), false);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+  assert.ok(report.repairs.some((repair) => repair.code === 'transaction-record-cleared'));
+});
+
+test('doctor --repair keeps a staged Reauthentication when the old Credential is gone', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const teamDir = path.join(harness.profilesDir, 'team');
+  const stagedCredential = path.join(teamDir, 'codex-new.json');
+  const newCredential = path.join(harness.activeDir, 'codex-new.json');
+  const oldCredential = path.join(harness.activeDir, 'codex-old.json');
+  fs.mkdirSync(teamDir, { recursive: true, mode: 0o700 });
+  writeCredential(harness.activeDir, 'codex-new.json', 'team@example.com', {
+    access_token: 'new-secret',
+  });
+  setActiveProfile(harness.profilesDir, 'team');
+  const transaction = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'reauth',
+    pid: 7777,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [{
+      type: 'move',
+      source: stagedCredential,
+      destination: newCredential,
+      generated: true,
+      started: true,
+      applied: true,
+    }],
+    generatedCredentialPaths: [stagedCredential],
+    generatedCredentialIdentities: [generatedIdentity(stagedCredential, newCredential)],
+    credentialPathsBefore: [oldCredential],
+    preservedCredentialPath: oldCredential,
+  });
+  fs.writeFileSync(harness.transactionFile, transaction, { mode: 0o600 });
+  const credentialBefore = fs.readFileSync(newCredential, 'utf8');
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.equal(fs.readFileSync(newCredential, 'utf8'), credentialBefore);
+  assert.equal(fs.readFileSync(harness.transactionFile, 'utf8'), transaction);
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-ambiguous'));
+  assert.doesNotMatch(JSON.stringify(report), /new-secret/);
+});
+
+test('doctor --repair reports malformed Reauthentication provenance as ambiguous JSON', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const oldCredential = path.join(harness.activeDir, 'codex-old.json');
+  writeCredential(harness.activeDir, 'codex-old.json', 'team@example.com');
+  setActiveProfile(harness.profilesDir, 'team');
+  const transaction = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'reauth',
+    pid: 7878,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [],
+    generatedCredentialPaths: [],
+    generatedCredentialIdentities: [],
+    credentialPathsBefore: [null],
+    preservedCredentialPath: oldCredential,
+  });
+  fs.writeFileSync(harness.transactionFile, transaction, { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.deepEqual(result.stderr, []);
+  assert.equal(fs.readFileSync(harness.transactionFile, 'utf8'), transaction);
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-ambiguous'));
+});
+
+test('doctor --repair leaves an unrecorded active Reauthentication Credential unchanged', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const teamDir = path.join(harness.profilesDir, 'team');
+  const oldCredential = path.join(harness.activeDir, 'codex-old.json');
+  const newCredential = path.join(teamDir, 'codex-new.json');
+  writeCredential(harness.activeDir, 'codex-old.json', 'team@example.com');
+  writeCredential(teamDir, 'codex-new.json', 'team@example.com');
+  setActiveProfile(harness.profilesDir, 'team');
+  const transaction = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'reauth',
+    pid: 7879,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [],
+    generatedCredentialPaths: [],
+    generatedCredentialIdentities: [],
+    credentialPathsBefore: [oldCredential],
+    credentialIdentitiesBefore: [generatedIdentity(oldCredential)],
+    preservedCredentialPath: oldCredential,
+    loginDirectory: teamDir,
+  });
+  fs.writeFileSync(harness.transactionFile, transaction, { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.equal(fs.existsSync(oldCredential), true);
+  assert.equal(fs.existsSync(newCredential), true);
+  assert.equal(fs.readFileSync(harness.transactionFile, 'utf8'), transaction);
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-ambiguous'));
+});
+
+test('doctor --repair removes a staged Reauthentication and keeps the old Credential', (t) => {
+  const harness = createHarness(t, { isProcessRunning: () => false });
+  const personalDir = path.join(harness.profilesDir, 'personal');
+  const stagedCredential = path.join(personalDir, 'codex-new.json');
+  const newCredential = path.join(harness.activeDir, 'codex-new.json');
+  const oldCredential = path.join(harness.activeDir, 'codex-old.json');
+  fs.mkdirSync(personalDir, { recursive: true, mode: 0o700 });
+  writeCredential(harness.activeDir, 'codex-old.json', 'personal@example.com', {
+    access_token: 'old-secret',
+  });
+  writeCredential(harness.activeDir, 'codex-new.json', 'personal@example.com', {
+    access_token: 'new-secret',
+  });
+  setActiveProfile(harness.profilesDir, 'personal');
+  fs.writeFileSync(harness.transactionFile, JSON.stringify({
+    schemaVersion: 1,
+    operation: 'reauth',
+    pid: 7979,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [
+      {
+        type: 'move',
+        source: stagedCredential,
+        destination: newCredential,
+        generated: true,
+        started: true,
+        applied: true,
+      },
+      {
+        type: 'delete-file',
+        path: oldCredential,
+        started: false,
+        applied: false,
+      },
+    ],
+    generatedCredentialPaths: [stagedCredential],
+    generatedCredentialIdentities: [generatedIdentity(stagedCredential, newCredential)],
+    credentialPathsBefore: [oldCredential],
+    preservedCredentialPath: oldCredential,
+  }), { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 0);
+  assert.equal(fs.existsSync(newCredential), false);
+  assert.equal(fs.existsSync(oldCredential), true);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+  assert.ok(report.repairs.some((repair) => repair.code === 'transaction-restored'));
+  assert.doesNotMatch(JSON.stringify(report), /old-secret|new-secret/);
+});
+
+test('doctor --repair rejects a transaction that treats a storage root as a staged item', (t) => {
+  const harness = createHarness(t);
+  const unsafeSource = path.join(harness.profilesDir, 'team');
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(harness.profilesDir, { recursive: true, mode: 0o700 });
+  const transaction = JSON.stringify({
+    schemaVersion: 1,
+    operation: 'use',
+    pid: 7474,
+    startedAt: '2026-08-13T00:00:00.000Z',
+    status: 'recovery-required',
+    steps: [{
+      type: 'move',
+      source: unsafeSource,
+      destination: harness.activeDir,
+      generated: false,
+      started: true,
+      applied: true,
+    }],
+    generatedCredentialPaths: [],
+  });
+  fs.writeFileSync(harness.transactionFile, transaction, { mode: 0o600 });
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.equal(fs.existsSync(harness.activeDir), true);
+  assert.equal(fs.existsSync(unsafeSource), false);
+  assert.equal(fs.readFileSync(harness.transactionFile, 'utf8'), transaction);
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-ambiguous'));
+});
+
+test('doctor --repair reports a symlinked Profile root without changing its target', (t) => {
+  const harness = createHarness(t);
+  const outside = path.join(harness.root, 'outside-profiles');
+  const outsideCredential = path.join(outside, 'codex-outside.json');
+  fs.mkdirSync(outside, { mode: 0o755 });
+  fs.writeFileSync(outsideCredential, JSON.stringify({
+    email: 'outside@example.com',
+    access_token: 'outside-secret',
+  }), { mode: 0o644 });
+  fs.symlinkSync(outside, harness.profilesDir, 'dir');
+  const credentialBefore = fs.readFileSync(outsideCredential, 'utf8');
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.deepEqual(report.repairs, []);
+  assert.ok(report.issues.some((issue) => issue.code === 'unsafe-profile-storage'));
+  assert.equal(permissionMode(outside), 0o755);
+  assert.equal(permissionMode(outsideCredential), 0o644);
+  assert.equal(fs.readFileSync(outsideCredential, 'utf8'), credentialBefore);
+  assert.doesNotMatch(JSON.stringify(report), /outside-secret/);
+});
+
+test('doctor --repair leaves unexpected Profile storage unchanged', (t) => {
+  const harness = createHarness(t);
+  const teamDir = path.join(harness.profilesDir, 'team');
+  const credential = path.join(teamDir, 'codex-team.json');
+  const unexpected = path.join(teamDir, 'notes.txt');
+  writeCredential(teamDir, 'codex-team.json', 'team@example.com');
+  fs.writeFileSync(unexpected, 'manual note', { mode: 0o666 });
+  fs.chmodSync(teamDir, 0o755);
+  fs.chmodSync(credential, 0o644);
+  fs.chmodSync(unexpected, 0o666);
+  const unexpectedBefore = fs.readFileSync(unexpected, 'utf8');
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.equal(permissionMode(teamDir), 0o755);
+  assert.equal(permissionMode(credential), 0o644);
+  assert.equal(permissionMode(unexpected), 0o666);
+  assert.equal(fs.readFileSync(unexpected, 'utf8'), unexpectedBefore);
+  assert.ok(report.issues.some((issue) => issue.code === 'unexpected-file'));
+});
+
+test('doctor --repair leaves an invalid Profile directory unchanged', (t) => {
+  const harness = createHarness(t);
+  const invalidDir = path.join(harness.profilesDir, 'doctor');
+  const credential = path.join(invalidDir, 'codex-doctor.json');
+  writeCredential(invalidDir, 'codex-doctor.json', 'invalid@example.com');
+  fs.chmodSync(invalidDir, 0o755);
+  fs.chmodSync(credential, 0o644);
+
+  const result = harness.run(['doctor', '--repair', '--json']);
+  const report = readJson(result);
+
+  assert.equal(result.code, 3);
+  assert.equal(permissionMode(invalidDir), 0o755);
+  assert.equal(permissionMode(credential), 0o644);
+  assert.ok(report.issues.some((issue) => issue.code === 'invalid-profile-name'));
+});
+
 test('read command arguments use stable invalid-input and unsafe-state exit codes', (t) => {
   const harness = createHarness(t);
 
@@ -372,6 +1645,7 @@ test('read command arguments use stable invalid-input and unsafe-state exit code
   const invalidAccountChangeList = harness.run(['list', '--allow-account-change']);
   const invalidAccountChangeUse = harness.run(['use', 'personal', '--allow-account-change']);
   const invalidYesUse = harness.run(['use', 'personal', '--yes']);
+  const invalidRepairList = harness.run(['list', '--repair']);
   const help = harness.run(['help']);
   const unknownReauth = harness.run(['reauth', 'missing']);
   const unsafe = harness.run(['doctor', '--json', '--force']);
@@ -384,7 +1658,9 @@ test('read command arguments use stable invalid-input and unsafe-state exit code
   assert.equal(invalidAccountChangeList.code, 2);
   assert.equal(invalidAccountChangeUse.code, 2);
   assert.equal(invalidYesUse.code, 2);
+  assert.equal(invalidRepairList.code, 2);
   assert.equal(help.code, 0);
+  assert.ok(help.stdout.some((line) => line.includes('doctor --repair [--json] [--force]')));
   assert.ok(help.stdout.some((line) => line.includes('reauth NAME')));
   assert.ok(help.stdout.some((line) => line.includes('deactivate [--force]')));
   assert.ok(help.stdout.some((line) => line.includes('delete NAME [--yes] [--force]')));
@@ -438,6 +1714,30 @@ test('add logs in and makes the new Profile active', (t) => {
   assert.deepEqual(credentialNames(harness.activeDir), ['codex-login-1.json']);
   assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), ['codex-personal.json']);
   assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'team')), []);
+});
+
+test('add detects a generated Credential that reuses the old active path', (t) => {
+  let harness;
+  harness = createHarness(t, {
+    login() {
+      writeCredential(harness.activeDir, 'codex-personal.json', 'team@example.com');
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['add', 'team']);
+
+  assert.equal(result.code, 0);
+  assert.equal(readActiveProfile(harness.profilesDir), 'team');
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(harness.activeDir, 'codex-personal.json'), 'utf8')).email,
+    'team@example.com',
+  );
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(harness.profilesDir, 'personal', 'codex-personal.json'), 'utf8')).email,
+    'personal@example.com',
+  );
 });
 
 test('deactivate keeps the active Profile as a ready deactivated Profile', (t) => {

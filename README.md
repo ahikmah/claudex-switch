@@ -61,6 +61,27 @@ claudex-switch doctor
 claudex-switch doctor --json
 ```
 
+Apply only repairs that have one safe result:
+
+```bash
+claudex-switch doctor --repair
+claudex-switch doctor --repair --json
+```
+
+Repair sets known Profile directories to `0700` and known Credential, state,
+lock, and transaction files to `0600`. It removes an operation lock only when
+the recorded owner process is not running. It can also restore a staged
+transaction when the recovery record and current files define one safe
+rollback result.
+
+Repair uses the Profile operation lock. It does not follow symlinks, change
+unexpected files, guess an ambiguous transaction result, expose Credential
+data, or select another Profile. Unsafe or incomplete state remains in place
+and returns exit code `3`. Human and JSON output include stable issue and
+repair codes. A running Claudex or proxy session stops repair. Use `--force`
+only to bypass this session warning; all lock, storage, and recovery checks
+remain active.
+
 Health statuses are `active`, `ready`, `needs-reauth`, `invalid`,
 `unregistered`, and `unknown`. Offline inspection does not contact the
 provider or change local files. JSON output uses `schemaVersion: 1` and does
