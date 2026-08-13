@@ -79,6 +79,21 @@ and makes the new profile active:
 claudex-switch add personal
 ```
 
+Reauthenticate an existing Profile. The command keeps the Profile active or
+inactive as it was before the command:
+
+```bash
+claudex-switch reauth personal
+```
+
+The old Credential stays available until the new login creates one valid local
+Credential. A changed Provider account email stops the command unless you use
+the explicit opt-in:
+
+```bash
+claudex-switch reauth personal --allow-account-change
+```
+
 Rename a profile:
 
 ```bash

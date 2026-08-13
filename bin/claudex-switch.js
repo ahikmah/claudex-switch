@@ -121,13 +121,16 @@ function resolveConfigFile() {
   return candidates.find((candidate) => fs.existsSync(candidate)) || '';
 }
 
-function login() {
+function login(directory = activeDir) {
   const args = [];
   const configFile = resolveConfigFile();
   if (configFile) args.push('--config', configFile);
   args.push('--codex-login');
 
-  const result = spawnSync(cliproxyapiBin, args, { stdio: 'inherit' });
+  const result = spawnSync(cliproxyapiBin, args, {
+    stdio: 'inherit',
+    env: { ...process.env, CLIPROXY_AUTH_DIR: directory },
+  });
   if (result.error) throw new Error(`Cannot run ${cliproxyapiBin}: ${result.error.message}`);
   if (result.status !== 0) throw new Error(`${cliproxyapiBin} login failed`);
 }

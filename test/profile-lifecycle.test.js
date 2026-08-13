@@ -363,10 +363,22 @@ test('read command arguments use stable invalid-input and unsafe-state exit code
 
   const invalidCommand = harness.run(['not-a-command']);
   const invalidJsonUse = harness.run(['use', 'personal', '--json']);
+  const invalidJsonReauth = harness.run(['reauth', 'personal', '--json']);
+  const invalidAccountChangeList = harness.run(['list', '--allow-account-change']);
+  const invalidAccountChangeUse = harness.run(['use', 'personal', '--allow-account-change']);
+  const help = harness.run(['help']);
+  const unknownReauth = harness.run(['reauth', 'missing']);
   const unsafe = harness.run(['doctor', '--json', '--force']);
 
   assert.equal(invalidCommand.code, 2);
   assert.equal(invalidJsonUse.code, 2);
+  assert.equal(invalidJsonReauth.code, 2);
+  assert.equal(invalidAccountChangeList.code, 2);
+  assert.equal(invalidAccountChangeUse.code, 2);
+  assert.equal(help.code, 0);
+  assert.ok(help.stdout.some((line) => line.includes('reauth NAME')));
+  assert.equal(unknownReauth.code, 2);
+  assert.match(unknownReauth.stderr[0], /unknown profile/i);
   assert.equal(unsafe.code, 2);
 });
 
@@ -415,6 +427,413 @@ test('add logs in and makes the new Profile active', (t) => {
   assert.deepEqual(credentialNames(harness.activeDir), ['codex-login-1.json']);
   assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), ['codex-personal.json']);
   assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'team')), []);
+});
+
+test('reauth replaces the active Profile Credential after validation', (t) => {
+  const harness = createHarness(t, {
+    login(loginDirectory) {
+      writeCredential(loginDirectory, 'codex-reauthenticated.json', 'personal@example.com', {
+        access_token: 'new-secret',
+      });
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com', {
+    access_token: 'old-secret',
+  });
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['reauth', 'personal']);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(result.stdout, [
+    'Starting Codex login for Profile: personal',
+    'Reauthenticated Profile: personal',
+  ]);
+  assert.deepEqual(result.stderr, []);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-reauthenticated.json']);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), []);
+  assert.deepEqual(harness.events, ['proxy:before', 'proxy:after']);
+});
+
+test('reauth replaces an inactive Profile Credential without selecting it', (t) => {
+  const harness = createHarness(t, {
+    login() {
+      writeCredential(harness.activeDir, 'codex-team-reauthenticated.json', 'team@example.com', {
+        access_token: 'new-secret',
+      });
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com', {
+    access_token: 'personal-secret',
+  });
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'team@example.com', {
+    access_token: 'old-secret',
+  });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['reauth', 'team']);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(result.stdout, [
+    'Starting Codex login for Profile: team',
+    'Reauthenticated Profile: team',
+  ]);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), []);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'team')), ['codex-team-reauthenticated.json']);
+  assert.deepEqual(harness.events, ['proxy:before', 'proxy:after']);
+});
+
+test('reauth replaces a deactivated Profile Credential without creating an active Profile', (t) => {
+  const harness = createHarness(t, {
+    login() {
+      writeCredential(harness.activeDir, 'codex-team-new.json', 'team@example.com');
+    },
+  });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'team@example.com', {
+    access_token: 'old-secret',
+  });
+
+  const result = harness.run(['reauth', 'team']);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(credentialNames(harness.activeDir), []);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'team')), ['codex-team-new.json']);
+  assert.equal(fs.existsSync(path.join(harness.profilesDir, 'active-profile')), false);
+});
+
+test('reauth keeps the old Credential until validation', (t) => {
+  let oldCredentialWasKept = false;
+  const harness = createHarness(t, {
+    login() {
+      const storedFiles = fs.readdirSync(harness.activeDir)
+        .filter((name) => name.startsWith('codex-') && name.endsWith('.json'));
+      oldCredentialWasKept = storedFiles.length === 1
+        && JSON.parse(fs.readFileSync(path.join(harness.activeDir, storedFiles[0]), 'utf8')).email
+          === 'personal@example.com';
+      writeCredential(harness.activeDir, 'codex-new.json', 'personal@example.com');
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['reauth', 'personal']);
+
+  assert.equal(result.code, 0);
+  assert.equal(oldCredentialWasKept, true);
+});
+
+test('reauth keeps the old Credential when login fails', (t) => {
+  const harness = createHarness(t, {
+    login() {
+      throw new Error('simulated login failure');
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com', {
+    access_token: 'old-secret',
+  });
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['reauth', 'personal']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /simulated login failure/);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(harness.activeDir, 'codex-personal.json'), 'utf8')).access_token,
+    'old-secret',
+  );
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), []);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('reauth keeps the old Credential when the new Credential is malformed', (t) => {
+  const harness = createHarness(t, {
+    login() {
+      fs.mkdirSync(harness.activeDir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(
+        path.join(harness.activeDir, 'codex-malformed.json'),
+        '{"email":"broken@example.com"',
+        { mode: 0o600 },
+      );
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com', {
+    access_token: 'old-secret',
+  });
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['reauth', 'personal']);
+
+  assert.equal(result.code, 3);
+  assert.match(result.stderr[0], /malformed/);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), []);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('reauth keeps the old Credential when login creates multiple Credentials', (t) => {
+  const harness = createHarness(t, {
+    login() {
+      writeCredential(harness.activeDir, 'codex-one.json', 'one@example.com');
+      writeCredential(harness.activeDir, 'codex-two.json', 'two@example.com');
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com', {
+    access_token: 'old-secret',
+  });
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['reauth', 'personal']);
+
+  assert.equal(result.code, 3);
+  assert.match(result.stderr[0], /exactly one|more than one/i);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), []);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('reauth rejects an existing Profile with duplicate Credential data', (t) => {
+  const harness = createHarness(t);
+  writeCredential(harness.activeDir, 'codex-personal.json', 'same@example.com', {
+    access_token: 'same-secret',
+  });
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'same@example.com', {
+    access_token: 'same-secret',
+  });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['reauth', 'personal']);
+
+  assert.equal(result.code, 3);
+  assert.match(result.stderr[0], /duplicated/i);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('reauth rejects new Credential data duplicated in another Profile', (t) => {
+  const harness = createHarness(t, {
+    login() {
+      writeCredential(harness.activeDir, 'codex-new.json', 'team@example.com', {
+        access_token: 'same-secret',
+      });
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com', {
+    access_token: 'old-secret',
+  });
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'team@example.com', {
+    access_token: 'same-secret',
+  });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['reauth', 'personal']);
+
+  assert.equal(result.code, 3);
+  assert.match(result.stderr[0], /duplicated/i);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'team')), ['codex-team.json']);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('reauth rejects a changed Provider account email without opt-in', (t) => {
+  const harness = createHarness(t, {
+    login() {
+      writeCredential(harness.activeDir, 'codex-new.json', 'new@example.com', {
+        access_token: 'new-secret',
+      });
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'old@example.com', {
+    access_token: 'old-secret',
+  });
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['reauth', 'personal']);
+
+  assert.equal(result.code, 2);
+  assert.match(result.stderr[0], /email changed|allow-account-change/i);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), []);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('reauth allows a changed Provider account email with explicit opt-in', (t) => {
+  const harness = createHarness(t, {
+    login() {
+      writeCredential(harness.activeDir, 'codex-new.json', 'new@example.com', {
+        access_token: 'new-secret',
+      });
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'old@example.com', {
+    access_token: 'old-secret',
+  });
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['reauth', 'personal', '--allow-account-change']);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-new.json']);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), []);
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('reauth allows the same Provider account email in separate Profiles', (t) => {
+  const harness = createHarness(t, {
+    login() {
+      writeCredential(harness.activeDir, 'codex-team-new.json', 'same@example.com', {
+        access_token: 'team-new-secret',
+      });
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'same@example.com', {
+    access_token: 'personal-secret',
+  });
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'same@example.com', {
+    access_token: 'team-old-secret',
+  });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['reauth', 'team']);
+  const list = harness.run(['list']);
+
+  assert.equal(result.code, 0);
+  assert.equal(list.code, 0);
+  assert.deepEqual(list.stdout, [
+    '* personal (same@example.com, active)',
+    '  team (same@example.com, ready)',
+  ]);
+});
+
+test('reauth uses the session warning and --force bypasses only that warning', (t) => {
+  let sessionRunning = true;
+  const harness = createHarness(t, {
+    isSessionRunning: () => sessionRunning,
+    login() {
+      writeCredential(harness.activeDir, 'codex-new.json', 'personal@example.com');
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const warned = harness.run(['reauth', 'personal']);
+  const forced = harness.run(['reauth', 'personal', '--force']);
+
+  assert.equal(warned.code, 1);
+  assert.match(warned.stderr[0], /claudex or proxy session is running/i);
+  assert.equal(forced.code, 0);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-new.json']);
+  assert.deepEqual(harness.events, ['proxy:before', 'proxy:after']);
+  sessionRunning = false;
+});
+
+test('reauth preserves a running proxy service state', (t) => {
+  const serviceEvents = [];
+  const harness = createHarness(t, {
+    proxyService: {
+      isRunning: () => true,
+      stop() {
+        serviceEvents.push('stop');
+      },
+      start() {
+        serviceEvents.push('start');
+      },
+    },
+    login() {
+      writeCredential(harness.activeDir, 'codex-new.json', 'personal@example.com');
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['reauth', 'personal', '--force']);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(serviceEvents, ['stop', 'start']);
+});
+
+test('reauth rolls back a failed inactive Profile replacement', (t) => {
+  let renameCount = 0;
+  const filesystem = new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'renameSync') return target[property];
+      return (source, destination) => {
+        renameCount += 1;
+        if (renameCount === 2) throw new Error('simulated reauth move failure');
+        return target.renameSync(source, destination);
+      };
+    },
+  });
+  const harness = createHarness(t, {
+    filesystem,
+    login() {
+      writeCredential(harness.activeDir, 'codex-new.json', 'team@example.com');
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'team@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const result = harness.run(['reauth', 'team']);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr[0], /simulated reauth move failure/);
+  assert.deepEqual(credentialNames(harness.activeDir), ['codex-personal.json']);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'personal')), []);
+  assert.deepEqual(credentialNames(path.join(harness.profilesDir, 'team')), ['codex-team.json']);
+  assert.equal(readActiveProfile(harness.profilesDir), 'personal');
+  assert.equal(fs.existsSync(harness.transactionFile), false);
+});
+
+test('reauth reports recovery when rollback also fails', (t) => {
+  let renameCount = 0;
+  const filesystem = new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'renameSync') return target[property];
+      return (source, destination) => {
+        renameCount += 1;
+        if (renameCount === 2 || renameCount === 3) throw new Error('simulated reauth rollback failure');
+        return target.renameSync(source, destination);
+      };
+    },
+  });
+  const harness = createHarness(t, {
+    filesystem,
+    login() {
+      writeCredential(harness.activeDir, 'codex-new.json', 'team@example.com');
+    },
+  });
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'team@example.com');
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const failed = harness.run(['reauth', 'team']);
+  const blocked = harness.run(['reauth', 'team', '--force']);
+
+  assert.equal(failed.code, 3);
+  assert.match(failed.stderr[0], /rollback failed|recovery/i);
+  assert.equal(fs.existsSync(harness.transactionFile), true);
+  assert.equal(blocked.code, 3);
+  assert.match(blocked.stderr[0], /recovery/i);
 });
 
 test('rename keeps the Credential and updates the active Profile name', (t) => {
