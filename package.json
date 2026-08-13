@@ -1,6 +1,6 @@
 {
   "name": "claudex-switch",
-  "version": "0.2.1",
+  "version": "0.2.0",
   "description": "Switch local CLIProxyAPI Codex OAuth profiles used by Claudex.",
   "keywords": [
     "claudex",

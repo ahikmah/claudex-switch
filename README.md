@@ -42,10 +42,16 @@ npm install --global claudex-switch
 
 ## Upgrade
 
-Version `0.2.1` fixes the executable command file. Upgrade with:
+Version `0.2.0` fixes the executable command file. Upgrade with:
 
 ```bash
-npm install --global claudex-switch@0.2.1
+npm install --global claudex-switch@0.2.0
+```
+
+After `0.2.0` is published, you can also update the global package with:
+
+```bash
+npm update --global claudex-switch
 ```
 
 Existing local Profiles and Credentials remain compatible. If `~/.zshrc`
