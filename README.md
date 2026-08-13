@@ -48,15 +48,11 @@ Version `0.2.0` fixes the executable command file. Upgrade with:
 npm install --global claudex-switch@0.2.0
 ```
 
-After `0.2.0` is published, you can also update the global package with:
+You can also update the global package with:
 
 ```bash
 npm update --global claudex-switch
 ```
-
-Existing local Profiles and Credentials remain compatible. If `~/.zshrc`
-contains `claudex-switch claude shell-init`, remove that old command. Use the
-`cs` alias to run the current CLI directly.
 
 ## Commands
 
