@@ -8,11 +8,11 @@ const test = require('node:test');
 
 const { createProfileLifecycle } = require('../lib/profile-lifecycle');
 
-function writeCredential(directory, filename, email) {
+function writeCredential(directory, filename, email, extra = {}) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   fs.writeFileSync(
     path.join(directory, filename),
-    JSON.stringify({ email }),
+    JSON.stringify({ email, ...extra }),
     { mode: 0o600 },
   );
 }
@@ -81,30 +81,274 @@ function credentialNames(directory) {
   return fs.readdirSync(directory).sort();
 }
 
+function readJson(result) {
+  assert.equal(result.stdout.length, 1);
+  return JSON.parse(result.stdout[0]);
+}
+
 test('list shows active and inactive Profiles with email addresses', (t) => {
   const harness = createHarness(t);
-  writeCredential(harness.activeDir, 'codex-personal.json', 'same@example.com');
-  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'same@example.com');
+  writeCredential(harness.activeDir, 'codex-personal.json', 'same@example.com', { scope: 'personal' });
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'same@example.com', { scope: 'team' });
   setActiveProfile(harness.profilesDir, 'personal');
 
   const result = harness.run(['list']);
 
   assert.equal(result.code, 0);
   assert.deepEqual(result.stdout, [
-    '* personal (same@example.com, 1 credential)',
-    '  team (same@example.com, 1 credential)',
+    '* personal (same@example.com, active)',
+    '  team (same@example.com, ready)',
   ]);
   assert.deepEqual(result.stderr, []);
 });
 
 test('current reports the active Profile', (t) => {
   const harness = createHarness(t);
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
   setActiveProfile(harness.profilesDir, 'personal');
 
   const result = harness.run(['current']);
 
   assert.equal(result.code, 0);
-  assert.deepEqual(result.stdout, ['personal']);
+  assert.deepEqual(result.stdout, ['Active Profile: personal (personal@example.com, active)']);
+});
+
+test('list, current, and doctor share the read-only JSON Profile contract', (t) => {
+  const harness = createHarness(t);
+  writeCredential(harness.activeDir, 'codex-personal.json', 'same@example.com', { scope: 'personal' });
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'same@example.com', { scope: 'team' });
+  setActiveProfile(harness.profilesDir, 'personal');
+
+  const list = harness.run(['list', '--json']);
+  const current = harness.run(['current', '--json']);
+  const doctor = harness.run(['doctor', '--json']);
+
+  const expectedProfiles = [
+    {
+      name: 'personal',
+      email: 'same@example.com',
+      active: true,
+      status: 'active',
+      errorCodes: [],
+    },
+    {
+      name: 'team',
+      email: 'same@example.com',
+      active: false,
+      status: 'ready',
+      errorCodes: [],
+    },
+  ];
+
+  assert.equal(list.code, 0);
+  assert.deepEqual(readJson(list), {
+    schemaVersion: 1,
+    profiles: expectedProfiles,
+    issues: [],
+  });
+  assert.equal(current.code, 0);
+  assert.deepEqual(readJson(current), {
+    schemaVersion: 1,
+    profile: expectedProfiles[0],
+    issues: [],
+  });
+  assert.equal(doctor.code, 0);
+  assert.deepEqual(readJson(doctor), {
+    schemaVersion: 1,
+    profiles: expectedProfiles,
+    issues: [],
+  });
+});
+
+test('read-only inspection does not create or change storage', (t) => {
+  const harness = createHarness(t);
+  const before = fs.readdirSync(harness.root).sort();
+
+  const list = harness.run(['list', '--json']);
+  const current = harness.run(['current', '--json']);
+  const doctor = harness.run(['doctor', '--json']);
+
+  assert.equal(list.code, 0);
+  assert.equal(current.code, 3);
+  assert.equal(doctor.code, 0);
+  assert.deepEqual(readJson(current), {
+    schemaVersion: 1,
+    profile: null,
+    issues: [{
+      code: 'no-active-profile',
+      profile: null,
+      message: 'No active Profile is recorded.',
+    }],
+  });
+  assert.deepEqual(fs.readdirSync(harness.root).sort(), before);
+  assert.equal(fs.existsSync(harness.profilesDir), false);
+  assert.equal(fs.existsSync(harness.activeDir), false);
+});
+
+test('doctor reports malformed, missing, multiple, and unexpected Credential storage', (t) => {
+  const harness = createHarness(t);
+  const malformedDir = path.join(harness.profilesDir, 'malformed');
+  const missingDir = path.join(harness.profilesDir, 'missing');
+  const multipleDir = path.join(harness.profilesDir, 'multiple');
+  const unexpectedDir = path.join(harness.profilesDir, 'unexpected');
+  fs.mkdirSync(malformedDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(
+    path.join(malformedDir, 'codex-bad.json'),
+    '{"email":"bad@example.com","access_token":"secret-token"',
+    { mode: 0o600 },
+  );
+  fs.mkdirSync(missingDir, { recursive: true, mode: 0o700 });
+  writeCredential(multipleDir, 'codex-one.json', 'one@example.com', { token: 'one' });
+  writeCredential(multipleDir, 'codex-two.json', 'two@example.com', { token: 'two' });
+  writeCredential(unexpectedDir, 'credential.txt', 'unexpected@example.com', { access_token: 'secret-token' });
+
+  const result = harness.run(['doctor', '--json']);
+  const report = readJson(result);
+  const profiles = new Map(report.profiles.map((profile) => [profile.name, profile]));
+
+  assert.equal(result.code, 3);
+  assert.equal(profiles.get('malformed').status, 'invalid');
+  assert.ok(profiles.get('malformed').errorCodes.includes('malformed-credential'));
+  assert.equal(profiles.get('missing').status, 'invalid');
+  assert.ok(profiles.get('missing').errorCodes.includes('missing-credential'));
+  assert.equal(profiles.get('multiple').status, 'invalid');
+  assert.ok(profiles.get('multiple').errorCodes.includes('multiple-credentials'));
+  assert.equal(profiles.get('unexpected').status, 'invalid');
+  assert.ok(profiles.get('unexpected').errorCodes.includes('unexpected-file'));
+  assert.deepEqual(
+    new Set(report.issues.map((issue) => issue.code)),
+    new Set(['malformed-credential', 'missing-credential', 'multiple-credentials', 'unexpected-file']),
+  );
+  assert.doesNotMatch(JSON.stringify(report), /secret-token/);
+});
+
+test('doctor reports symlinked Profile storage and non-private permissions', (t) => {
+  const harness = createHarness(t);
+  const outside = path.join(harness.root, 'outside');
+  fs.mkdirSync(outside, { mode: 0o700 });
+  writeCredential(outside, 'codex-outside.json', 'outside@example.com');
+  fs.mkdirSync(harness.profilesDir, { recursive: true, mode: 0o700 });
+  fs.symlinkSync(outside, path.join(harness.profilesDir, 'linked'), 'dir');
+
+  const linkedCredentialDir = path.join(harness.profilesDir, 'linked-credential');
+  writeCredential(linkedCredentialDir, 'codex-linked.json', 'linked@example.com');
+  const target = path.join(harness.root, 'target.json');
+  fs.writeFileSync(target, JSON.stringify({ email: 'linked@example.com', access_token: 'secret-token' }), { mode: 0o600 });
+  fs.unlinkSync(path.join(linkedCredentialDir, 'codex-linked.json'));
+  fs.symlinkSync(target, path.join(linkedCredentialDir, 'codex-linked.json'));
+
+  const publicDir = path.join(harness.profilesDir, 'public');
+  writeCredential(publicDir, 'codex-public.json', 'public@example.com');
+  fs.chmodSync(publicDir, 0o755);
+  fs.chmodSync(path.join(publicDir, 'codex-public.json'), 0o644);
+
+  const result = harness.run(['doctor', '--json']);
+  const report = readJson(result);
+  const profiles = new Map(report.profiles.map((profile) => [profile.name, profile]));
+
+  assert.equal(result.code, 3);
+  assert.ok(profiles.get('linked').errorCodes.includes('symlinked-profile'));
+  assert.ok(profiles.get('linked-credential').errorCodes.includes('symlinked-credential'));
+  assert.ok(profiles.get('public').errorCodes.includes('permissions'));
+  assert.ok(report.issues.some((issue) => issue.code === 'symlinked-profile'));
+  assert.ok(report.issues.some((issue) => issue.code === 'symlinked-credential'));
+  assert.ok(report.issues.some((issue) => issue.code === 'permissions'));
+  assert.doesNotMatch(JSON.stringify(report), /secret-token/);
+});
+
+test('doctor allows duplicate email values but rejects exact duplicate Credential data', (t) => {
+  const harness = createHarness(t);
+  writeCredential(path.join(harness.profilesDir, 'personal'), 'codex-personal.json', 'same@example.com', { token: 'personal' });
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'same@example.com', { token: 'team' });
+  writeCredential(path.join(harness.profilesDir, 'duplicate-one'), 'codex-one.json', 'duplicate@example.com', { token: 'duplicate-secret' });
+  writeCredential(path.join(harness.profilesDir, 'duplicate-two'), 'codex-two.json', 'duplicate@example.com', { token: 'duplicate-secret' });
+
+  const result = harness.run(['doctor', '--json']);
+  const report = readJson(result);
+  const profiles = new Map(report.profiles.map((profile) => [profile.name, profile]));
+
+  assert.equal(result.code, 3);
+  assert.equal(profiles.get('personal').status, 'ready');
+  assert.equal(profiles.get('team').status, 'ready');
+  assert.equal(profiles.get('duplicate-one').status, 'invalid');
+  assert.equal(profiles.get('duplicate-two').status, 'invalid');
+  assert.ok(profiles.get('duplicate-one').errorCodes.includes('duplicate-credential'));
+  assert.ok(profiles.get('duplicate-two').errorCodes.includes('duplicate-credential'));
+  assert.ok(report.issues.some((issue) => issue.code === 'duplicate-credential'));
+  assert.doesNotMatch(JSON.stringify(report), /duplicate-secret/);
+});
+
+test('doctor reports an active Credential without a matching Profile', (t) => {
+  const harness = createHarness(t);
+  writeCredential(harness.activeDir, 'codex-orphan.json', 'orphan@example.com', { token: 'secret-token' });
+  writeCredential(path.join(harness.profilesDir, 'known'), 'codex-known.json', 'known@example.com', { token: 'known' });
+
+  const result = harness.run(['doctor', '--json']);
+  const report = readJson(result);
+  const orphan = report.profiles.find((profile) => profile.active);
+
+  assert.equal(result.code, 3);
+  assert.equal(orphan.name, null);
+  assert.equal(orphan.email, 'orphan@example.com');
+  assert.equal(orphan.status, 'unregistered');
+  assert.deepEqual(orphan.errorCodes, ['unregistered-credential']);
+  assert.ok(report.issues.some((issue) => issue.code === 'unregistered-credential'));
+  assert.doesNotMatch(JSON.stringify(report), /secret-token/);
+});
+
+test('doctor reports unsafe active Credential permissions and incomplete recovery', (t) => {
+  const harness = createHarness(t);
+  writeCredential(harness.activeDir, 'codex-personal.json', 'personal@example.com', { token: 'secret-token' });
+  fs.mkdirSync(path.join(harness.profilesDir, 'personal'), { recursive: true, mode: 0o700 });
+  setActiveProfile(harness.profilesDir, 'personal');
+  fs.chmodSync(path.join(harness.activeDir, 'codex-personal.json'), 0o644);
+  fs.writeFileSync(
+    harness.transactionFile,
+    JSON.stringify({ schemaVersion: 1, status: 'recovery-required', operation: 'use' }),
+    { mode: 0o600 },
+  );
+
+  const result = harness.run(['doctor', '--json']);
+  const report = readJson(result);
+  const personal = report.profiles.find((profile) => profile.name === 'personal');
+
+  assert.equal(result.code, 3);
+  assert.equal(personal.status, 'invalid');
+  assert.ok(personal.errorCodes.includes('permissions'));
+  assert.ok(report.issues.some((issue) => issue.code === 'recovery-required'));
+  assert.doesNotMatch(JSON.stringify(report), /secret-token/);
+});
+
+test('doctor human output reports health and issue codes', (t) => {
+  const harness = createHarness(t);
+  writeCredential(path.join(harness.profilesDir, 'team'), 'codex-team.json', 'team@example.com');
+  fs.mkdirSync(path.join(harness.profilesDir, 'empty'), { recursive: true, mode: 0o700 });
+
+  const result = harness.run(['doctor']);
+
+  assert.equal(result.code, 3);
+  assert.deepEqual(result.stdout, [
+    'Profile health:',
+    '  empty (email unavailable, invalid)',
+    '  team (team@example.com, ready)',
+    "Issue [missing-credential]: Profile 'empty' has no Codex Credential.",
+  ]);
+  assert.deepEqual(result.stderr, []);
+});
+
+test('read command arguments use stable invalid-input and unsafe-state exit codes', (t) => {
+  const harness = createHarness(t);
+
+  const invalidCommand = harness.run(['not-a-command']);
+  const invalidJsonUse = harness.run(['use', 'personal', '--json']);
+  const unsafe = harness.run(['doctor', '--json', '--force']);
+
+  assert.equal(invalidCommand.code, 2);
+  assert.equal(invalidJsonUse.code, 2);
+  assert.equal(unsafe.code, 2);
 });
 
 test('use switches the active Credential and preserves the old Profile', (t) => {
@@ -212,7 +456,7 @@ test('current fails when no active Profile is recorded', (t) => {
 
   const result = harness.run(['current']);
 
-  assert.equal(result.code, 1);
+  assert.equal(result.code, 3);
   assert.deepEqual(result.stdout, []);
   assert.match(result.stderr[0], /no active profile/i);
 });

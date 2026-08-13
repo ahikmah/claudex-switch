@@ -39,17 +39,32 @@ npm install --global claudex-switch
 
 ## Commands
 
-List profiles and their email addresses:
+List Profiles with their email addresses and health status:
 
 ```bash
 claudex-switch list
 ```
 
-Show the active profile:
+Use `claudex-switch list --json` for stable machine-readable output.
+
+Show the active Profile:
 
 ```bash
 claudex-switch current
 ```
+
+Use `claudex-switch current --json` for machine-readable output. Run an
+offline health check with:
+
+```bash
+claudex-switch doctor
+claudex-switch doctor --json
+```
+
+Health statuses are `active`, `ready`, `needs-reauth`, `invalid`,
+`unregistered`, and `unknown`. Offline inspection does not contact the
+provider or change local files. JSON output uses `schemaVersion: 1` and does
+not include token values or Credential data.
 
 Switch without a new login:
 
@@ -79,6 +94,10 @@ If a Claudex or CLIProxyAPI session is running, the command prints a warning
 and stops. Use `--force` only to continue past this warning. It does not skip
 Profile validation, storage safety checks, the operation lock, or recovery
 checks.
+
+Exit code `0` means success, `1` means an operation or service failure, `2`
+means invalid command or input, and `3` means unsafe or incomplete local
+state.
 
 ## Safety
 
