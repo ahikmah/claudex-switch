@@ -7,6 +7,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const { createProfileLifecycle } = require('../lib/profile-lifecycle');
+const packageMetadata = require('../package.json');
 
 function writeCredential(directory, filename, email, extra = {}) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -1855,6 +1856,28 @@ test('read command arguments use stable invalid-input and unsafe-state exit code
   assert.equal(unknownReauth.code, 2);
   assert.match(unknownReauth.stderr[0], /unknown profile/i);
   assert.equal(unsafe.code, 2);
+});
+
+test('release help documents the Profile lifecycle contract', (t) => {
+  const harness = createHarness(t);
+  const result = harness.run(['help']);
+  const help = result.stdout.join('\n');
+
+  assert.equal(result.code, 0);
+  assert.match(help, /--json:.*list, current, and doctor/);
+  assert.match(help, /--online:.*doctor only.*read-only/);
+  assert.match(help, /--repair:.*doctor only.*deterministic/);
+  assert.match(help, /--force:.*bypass only the session warning/);
+  assert.match(help, /--yes:.*delete only.*exact Profile-name confirmation/);
+  assert.match(help, /--allow-account-change:.*reauth only.*Provider account email/);
+  assert.match(help, /Profile names .*letters, numbers, dot, underscore, or hyphen/);
+  assert.match(help, /Email addresses may repeat.*exact duplicate Credential data/);
+  assert.match(help, /failed rollback.*doctor --repair/);
+  assert.match(help, /Remote Provider accounts are never deleted/);
+  assert.match(help, /schemaVersion: 1/);
+  assert.match(help, /active, ready, needs-reauth, invalid, unregistered, unknown/);
+  assert.match(help, /0 success, 1 operation or service failure, 2 invalid input, 3 unsafe or incomplete state/);
+  assert.equal(packageMetadata.version, '0.2.0');
 });
 
 test('use switches the active Credential and preserves the old Profile', (t) => {
