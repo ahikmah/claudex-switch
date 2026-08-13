@@ -42,10 +42,10 @@ npm install --global claudex-switch
 
 ## Upgrade
 
-Version `0.2.0` fixes the executable command file. Upgrade with:
+The latest release is `0.2.1`. Upgrade with:
 
 ```bash
-npm install --global claudex-switch@0.2.0
+npm install --global claudex-switch@0.2.1
 ```
 
 You can also update the global package with:

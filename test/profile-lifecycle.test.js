@@ -1877,7 +1877,7 @@ test('release help documents the Profile lifecycle contract', (t) => {
   assert.match(help, /schemaVersion: 1/);
   assert.match(help, /active, ready, needs-reauth, invalid, unregistered, unknown/);
   assert.match(help, /0 success, 1 operation or service failure, 2 invalid input, 3 unsafe or incomplete state/);
-  assert.equal(packageMetadata.version, '0.2.0');
+  assert.equal(packageMetadata.version, '0.2.1');
 });
 
 test('the package command entry point is executable', () => {
